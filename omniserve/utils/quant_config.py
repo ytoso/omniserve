@@ -53,3 +53,23 @@ class QServeQuantConfig:
     @classmethod
     def get_row_parallel_tensor_names(cls) -> List[str]:
         return ["weight"]
+
+
+class NVFP4QuantConfig:
+    """Config for the experimental NVFP4 (W4A8-FP) path (Blackwell-only).
+
+    Weights are stored as E2M1 (NVFP4) with per-block E4M3 scales and a global
+    FP32 scale. Accuracy is intentionally traded for efficiency in this
+    experiment.
+    """
+
+    def __init__(self, block_size: int = 16) -> None:
+        self.weight_bits = 4
+        self.block_size = block_size
+
+    def __repr__(self) -> str:
+        return f"NVFP4QuantConfig(block_size={self.block_size})"
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "nvfp4"
