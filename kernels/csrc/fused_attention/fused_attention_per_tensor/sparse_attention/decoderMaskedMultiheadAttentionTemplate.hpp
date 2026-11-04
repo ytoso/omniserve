@@ -27,6 +27,13 @@
  * limitations under the License.
  */
 #pragma once
+// CUB >= 3.0 (CUDA 13) removed the cub::Max functor. Minimal local replacement
+// so the QServe attention templates still compile on CUDA 13.x.
+struct cub_max_compat {
+  template <typename T>
+  __host__ __device__ T operator()(T a, T b) const { return (a > b) ? a : b; }
+};
+
 
 #include "../../common/cudaTypeUtils.cuh"
 #include "../../common/memoryUtils.h"
@@ -2322,7 +2329,7 @@ if constexpr (ENABLE_4BITS_CACHE && ENABLE_ZEROS)
                 __shared__ typename BlockReduce::TempStorage temp_storage;
                 // Obtain a segment of consecutive items that are blocked across threads (final_max from above)
                 // Compute the block-wide max for thread0
-                final_max = BlockReduce(temp_storage).Reduce(thread_partial_max, cub::Max(), gridDim.z);
+                final_max = BlockReduce(temp_storage).Reduce(thread_partial_max, cub_max_compat(), gridDim.z);
 
                 __shared__ float final_max_smem;
                 if (tidx == 0)
