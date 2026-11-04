@@ -16,26 +16,31 @@ points) with a **single-stage FP16 → NVFP4** path:
 | Part | Status |
 |---|---|
 | A — data-format layer (Python/torch) | ✅ done, tested on CPU |
-| B — fused FP4 GEMM kernel (CUDA) | ⛔ pending — requires SM100 + CUDA ≥ 12.8 |
+| B — fused FP4 GEMM kernel (CUDA) | 🟡 cuBLASLt FP4 (W4A4) validated + benchmarked on Thor (sm_110); pybind/linear dispatch still open |
 
 The existing INT4/INT8 kernels are **kept untouched** as a fallback; the NVFP4
 path is additive.
 
 ## Hard constraint (read this first)
 
-NVFP4 (E2M1) tensor-core MMA instructions **only exist on SM100** (Blackwell:
-B100/B200/GB200 = compute capability 10.0; RTX 50-series = 12.0). On
+NVFP4 (E2M1) tensor-core MMA instructions **only exist on Blackwell**
+(B100/B200/GB200 = 10.0, Blackwell Ultra = 11.0, RTX 50-series = 12.0). On
 Ampere/Hopper/Ada there is no FP4 MMA — FP4 can only be *emulated* by dequant to
 FP16, which is the slow path QServe exists to avoid.
+
+**This machine is a Jetson AGX Thor Developer Kit**: `NVIDIA Thor`,
+compute capability **11.0** (SM110), 20 SMs, driver 595.78 / CUDA **13.2**.
+CUDA 13.2 toolkit has been installed to `/usr/local/cuda` from NVIDIA's
+`ubuntu2404/sbsa` repo (toolkit only, no data-center drivers).
 
 Existing kernels target SM 8.0–9.0 and use `mma.sync ... .s8.s8.s32` (int8
 tensor cores). They cannot be adapted to FP4; Part B is a new kernel.
 
 Toolchain requirements for Part B:
-- CUDA ≥ 12.8 (12.9 for cuBLAS/cuBLASLt FP4 GEMM).
+- CUDA ≥ 12.8 (12.9 for cuBLAS/cuBLASLt FP4 GEMM); **13.0+ for sm_110**.
 - Recent PyTorch (the repo pins `torch==2.2.0`; Blackwell FP8/FP4 needs 2.7+).
-- `kernels/setup.py` `SUPPORTED_ARCHS` currently = `{"8.0","8.6","8.7","8.9","9.0"}`;
-  add `"10.0"` (and `"12.0"` if targeting consumer Blackwell).
+- `kernels/setup.py` `SUPPORTED_ARCHS` now includes `"10.0"`, `"11.0"`, `"12.0"`
+  and the gencode loop handles 3-digit arch names.
 
 ## Part A — what's done
 
@@ -82,16 +87,23 @@ Single-stage quantization (already implemented in `quantize_weight_nvfp4`):
 
 ## Part B — remaining work
 
-1. **Kernel strategy** (pick one, in increasing effort):
-   - cuBLAS / cuBLASLt FP4 GEMM — least code, loses fused epilogue.
-   - CUTLASS SM100 FP4 kernels (`cutlass::nv_float4_t` / MXFP4).
-   - hand-written SM100 kernel (full rewrite of `qgemm/w4a8_per_*`).
+1. **Kernel strategy** — validated the **cuBLASLt FP4 GEMM** path first
+   (least code). See `kernels/csrc/qgemm/nvfp4/`:
+   - `fp4_cublaslt_validate.cu`: `CUDA_R_4F_E2M1` × `CUDA_R_4F_E2M1`,
+     `VEC16_UE4M3` block scales, TN layout. Matches dequantized reference
+     **exactly** (`vs deqref = 0.000000`).
+   - `fp4_cublaslt_bench.cu`: FP4 vs FP16 throughput on Thor (see README there).
+   - ⚠️ **cuBLASLt FP4 = W4A4** (A and B both FP4). cuBLASLt does **not**
+     expose FP8 (E4M3) × FP4 (E2M1). A true W4A8-FP needs a hand-written
+     `mma.sync ... kind::mxf8f6f4 ... .e4m3.e2m1 ...` kernel (or CUTLASS).
 2. Add `omniserve_backend.qgemm_nvfp4` (new `pybind.cpp` + `.cu` under
-   `kernels/csrc/qgemm/nvfp4/`, register in `kernels/setup.py`).
+   `kernels/csrc/qgemm/nvfp4/`, register in `kernels/setup.py`). The standalone
+   cuBLASLt probes are already there; the pybind wrapper is the next step.
 3. Dispatch from `NVFP4Linear.forward` (currently a reference dequant+`F.linear`).
 4. **Activation side (open decision):** current A8 is per-token **INT8**
    (`fused_kernels.cu::invoke_quant*`). Blackwell FP4 GEMMs want **FP8 (E4M3)**
    activations — decide whether to switch the activation quant kernel too.
+   (Note: with the cuBLASLt W4A4 path, activations must also be FP4.)
 5. Wire `NVFP4Linear` into a model (clone `llama_w4a8_unpad.py` → e.g.
    `llama_nvfp4_unpad.py`) and add a checkpoint converter (direct HF FP16 →
    NVFP4, no calibration needed since accuracy is aside).
@@ -130,6 +142,8 @@ Expected (CPU, torch 2.8):
 
 ## Open questions for the next agent
 
-1. Which Blackwell GPU exactly (B200 vs GB200 vs RTX 50) and CUDA version?
-2. cuBLAS vs CUTLASS vs hand-written kernel?
+1. ~~Which Blackwell GPU exactly~~ → **Jetson AGX Thor, sm_110, CUDA 13.2**.
+2. cuBLAS vs CUTLASS vs hand-written kernel? → **cuBLASLt validated (W4A4)**;
+   for true W4A8-FP use a hand-written `mxf8f6f4 .e4m3.e2m1` kernel or CUTLASS.
 3. Switch activations from INT8 to FP8 E4M3, or keep INT8 activations?
+   (cuBLASLt path forces FP4 activations.)

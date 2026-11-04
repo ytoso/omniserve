@@ -13,7 +13,9 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 ROOT_DIR = os.path.dirname(__file__)
 
 # Supported NVIDIA GPU architectures.
-SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0"}
+# Blackwell FP4 tensor cores are SM100/SM110/SM120 (10.0, 11.0, 12.0);
+# the NVFP4 experiment targets these in addition to the legacy QServe arches.
+SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0", "10.0", "11.0", "12.0"}
 
 # Compiler flags.
 CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
@@ -138,13 +140,23 @@ if nvcc_cuda_version < Version("11.8"):
     if any(cc.startswith("9.0") for cc in compute_capabilities):
         raise RuntimeError(
             "CUDA 11.8 or higher is required for compute capability 9.0.")
+if any(cc.startswith(("10.", "12.")) for cc in compute_capabilities):
+    if nvcc_cuda_version < Version("12.8"):
+        raise RuntimeError(
+            "CUDA 12.8 or higher is required for Blackwell compute "
+            "capabilities 10.x/12.x.")
+if any(cc.startswith("11.") for cc in compute_capabilities):
+    if nvcc_cuda_version < Version("13.0"):
+        raise RuntimeError(
+            "CUDA 13.0 or higher is required for compute capability 11.x.")
 
 # Add target compute capabilities to NVCC flags.
 for capability in compute_capabilities:
-    num = capability[0] + capability[2]
-    NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
+    num = capability.split("+")[0].replace(".", "")
     if capability.endswith("+PTX"):
         NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
+    else:
+        NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
 
 # Use NVCC threads to parallelize the build.
 if nvcc_cuda_version >= Version("11.2"):

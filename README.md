@@ -1,7 +1,8 @@
 # NVFP4 (W4A8-FP) Experiment
 
 > **Status:** Part A (data-format layer) done and tested on CPU.
-> Part B (fused GEMM kernel) pending — blocked on Blackwell hardware + CUDA toolchain.
+> Part B: cuBLASLt FP4 (W4A4) GEMM validated and benchmarked on a Blackwell
+> (Jetson AGX Thor, sm_110) GPU. pybind integration + linear dispatch still open.
 
 ## Goal
 
@@ -15,14 +16,18 @@ points) with a **single-stage FP16 → NVFP4** path:
 ## Why NVFP4 matters (and the hard constraint)
 
 NVFP4 (1 sign + 2 exponent + 1 mantissa) is NVIDIA's 4-bit float format. Its
-tensor-core MMA instructions **only exist on SM100 (Blackwell: B100/B200/GB200,
-RTX 50-series)**. On Ampere/Hopper/Ada there is no FP4 MMA — FP4 can only be
-*emulated* by dequantizing to FP16, which is exactly the slow path QServe exists
-to avoid.
+tensor-core MMA instructions **only exist on Blackwell** (B100/B200/GB200 =
+10.0, Blackwell Ultra = 11.0, RTX 50-series = 12.0). On Ampere/Hopper/Ada there
+is no FP4 MMA — FP4 can only be *emulated* by dequantizing to FP16, which is
+exactly the slow path QServe exists to avoid.
 
 The existing W4A8 kernels (`kernels/csrc/qgemm/w4a8_per_*`) target SM 8.0–9.0 and
 use `mma.sync ... .s8.s8.s32` (int8 tensor cores). They cannot be "swapped" to
-FP4; Part B is a full kernel effort requiring CUDA ≥ 12.8.
+FP4; Part B is a full kernel effort requiring CUDA ≥ 12.8 (13.0 for sm_110).
+
+This machine is a **Jetson AGX Thor Developer Kit** (Blackwell, compute
+capability **11.0**, 20 SMs, CUDA 13.2 toolkit installed to
+`/usr/local/cuda`).
 
 ## What's done (Part A)
 
@@ -68,22 +73,41 @@ Results (CPU, torch 2.8):
 - Weight round-trip: max abs err = 0.541, scale-relative err = 0.132.
 - `nn.Linear` vs `NVFP4Linear`: **10.4%** relative output error (expected for FP4; accuracy is out of scope).
 
-## Part B — remaining work (blocked)
+## Part B — progress
 
-1. **Target GPU / toolchain** — confirm Blackwell (SM100) access and CUDA ≥ 12.8
-   (e.g., the `user@syt` server). The current machine has no CUDA at all.
-2. **Kernel strategy** — pick one:
-   - cuBLAS / cuBLASLt FP4 GEMM (least code, loses fused epilogue),
-   - CUTLASS SM100 FP4 kernels (`cutlass::nv_float4_t` / MXFP4),
-   - hand-written SM100 kernel (full rewrite of `qgemm/w4a8_per_*`).
-3. Add `omniserve_backend.qgemm_nvfp4` and dispatch from `NVFP4Linear.forward`.
+1. **Target GPU / toolchain** ✅ — Jetson AGX Thor (sm_110), CUDA 13.2.
+2. **Kernel strategy** — validated the **cuBLASLt FP4 GEMM** path first:
+   - `kernels/csrc/qgemm/nvfp4/fp4_cublaslt_validate.cu` matches the
+     dequantized E2M1 reference exactly.
+   - `kernels/csrc/qgemm/nvfp4/fp4_cublaslt_bench.cu` measures FP4 vs FP16
+     (table below).
+   - ⚠️ cuBLASLt FP4 is **W4A4** (both operands FP4). A true W4A8-FP
+     (FP8 × FP4) needs a hand-written `mma.sync ... mxf8f6f4 .e4m3.e2m1`
+     kernel or CUTLASS.
+3. Add `omniserve_backend.qgemm_nvfp4` (pybind) and dispatch from
+   `NVFP4Linear.forward` — next step.
 4. Wire `NVFP4Linear` into `llama_w4a8_unpad.py` (or a new model) and a
    checkpoint converter (direct HF FP16 → NVFP4, no calibration needed).
 5. Benchmark prefill/decoding throughput vs the W4A8 INT4 baseline.
+
+### cuBLASLt FP4 (W4A4) vs FP16 on Jetson AGX Thor (sm_110, 20 SMs)
+
+| M | N | K | FP16 TFLOPS | FP4 TFLOPS | speedup |
+|---|---|---|---|---|---|
+| 1 | 4096 | 4096 | 0.3 | 2.5 | ~8x (mem-bound) |
+| 8 | 4096 | 4096 | 2.1 | 9.7 | 4.6x |
+| 128 | 4096 | 4096 | 33.7 | 320.0 | 9.5x |
+| 2048 | 4096 | 4096 | 154.5 | 375.5 | 2.4x |
+| 2048 | 13824 | 14336 | 99.4 | 527.4 | 5.3x |
+| 4096 | 4096 | 4096 | 114.9 | 342.1 | 3.0x |
+| 4096 | 14336 | 14336 | 101.9 | 556.1 | 5.5x |
+
+Numbers are wall-clock TFLOPS over warm loops, no fused epilogue.
 
 ## Open questions
 
 - Activation side: current A8 is per-token **INT8**. Blackwell FP4 GEMMs want
   **FP8 (E4M3)** activations — do we also switch the activation quant kernel?
+  (The cuBLASLt path forces FP4 activations.)
 - Per-tensor vs per-output-channel global scale (NVIDIA uses per-tensor for
   weights; keep per-tensor for now).
