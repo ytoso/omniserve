@@ -1,21 +1,20 @@
 """NVFP4 quantized linear layer (experimental, efficiency-first).
 
-Replaces ``nn.Linear`` with a single-stage FP16 -> NVFP4 (E2M1) weight
-quantization. Unlike the original QServe ``W4A8OF16LinearDynamicInputScale``,
-this layer has **no** progressive INT8 stage and **no** zero point: weights go
-straight to 4-bit floating point with per-block E4M3 scales + one global FP32
-scale.
+W4A4 (Atom-style): both weights and activations are quantized to NVFP4 (E2M1)
+with per-16-block UE4M3 scales, then multiplied with a Blackwell FP4 GEMM.
 
-The forward pass is currently a *reference* implementation (dequantize to float
-and call ``F.linear``). Part B will replace it with a fused SM100 FP4 GEMM
-kernel; see ``README_NVFP4.md``.
+- No progressive INT8 stage, no zero points.
+- Accuracy is intentionally ignored; the goal is to measure efficiency.
+- The forward pass below is a *reference* dequantize+``F.linear`` path. The
+  compiled ``omniserve_backend.qgemm_nvfp4`` (cuBLASLt) path is wired when the
+  backend is available.
 """
 
 import torch
 
 from omniserve.utils.nvfp4 import (
-    dequantize_weight_nvfp4,
-    quantize_weight_nvfp4,
+    dequantize_nvfp4_abs,
+    quantize_nvfp4_abs,
 )
 
 
@@ -36,18 +35,16 @@ class NVFP4Linear(torch.nn.Module):
                 f"in_features {in_features} not divisible by block_size {block_size}"
             )
 
-        # 2 E2M1 values packed per byte, low nibble first.
+        # 2 E2M1 values packed per byte, low nibble first (row-major [OC, IC/2]).
         self.register_buffer(
             "qweight",
             torch.zeros((out_features, in_features // 2), dtype=torch.uint8),
         )
-        # Per-block E4M3 scales (one per `block_size` elements along in_features).
+        # Absolute per-block UE4M3 scales, one per `block_size` input elements.
         self.register_buffer(
             "w_scale",
             torch.zeros((out_features, in_features // block_size), dtype=torch.uint8),
         )
-        # Single FP32 global scale for the whole weight tensor.
-        self.register_buffer("w_global_scale", torch.zeros((), dtype=torch.float32))
 
         if bias:
             self.register_buffer("bias", torch.zeros(out_features, dtype=torch.float16))
@@ -56,12 +53,20 @@ class NVFP4Linear(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Reference path: dequantize weights and use a standard GEMM.
-        # Part B replaces this with `omniserve_backend.qgemm_nvfp4`.
-        w = dequantize_weight_nvfp4(self.qweight, self.w_scale, self.w_global_scale)
-        bias = None if self.bias is None else self.bias.float()
-        out = torch.nn.functional.linear(x.float(), w.float(), bias)
-        return out.to(x.dtype)
+        try:
+            import omniserve_backend.qgemm_nvfp4 as qgemm_nvfp4
+
+            return qgemm_nvfp4.gemm_forward_cuda(
+                x, self.qweight, self.w_scale, self.bias
+            )
+        except Exception:
+            # Reference path: W4A4 dequantize + FP32 GEMM.
+            qact, act_scale = quantize_nvfp4_abs(x.float(), self.block_size)
+            x_deq = dequantize_nvfp4_abs(qact, act_scale)
+            w_deq = dequantize_nvfp4_abs(self.qweight, self.w_scale)
+            bias = None if self.bias is None else self.bias.float()
+            out = torch.nn.functional.linear(x_deq, w_deq, bias)
+            return out.to(x.dtype)
 
     @classmethod
     def from_linear(cls, linear: torch.nn.Linear, block_size: int = 16) -> "NVFP4Linear":
@@ -71,12 +76,9 @@ class NVFP4Linear(torch.nn.Module):
             linear.bias is not None,
             block_size,
         )
-        qweight, w_scale, global_scale = quantize_weight_nvfp4(
-            linear.weight.data, block_size
-        )
+        qweight, w_scale = quantize_nvfp4_abs(linear.weight.data, block_size)
         q_linear.qweight.copy_(qweight)
         q_linear.w_scale.copy_(w_scale)
-        q_linear.w_global_scale.copy_(global_scale)
         if linear.bias is not None:
             q_linear.bias.copy_(linear.bias.data.half())
         return q_linear

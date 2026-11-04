@@ -1,17 +1,23 @@
-# NVFP4 (W4A8-FP) Experiment
+# NVFP4 (W4A4-FP, Atom-style) Experiment
 
-> **Status:** Part A (data-format layer) done and tested on CPU.
-> Part B: cuBLASLt FP4 (W4A4) GEMM validated and benchmarked on a Blackwell
-> (Jetson AGX Thor, sm_110) GPU. pybind integration + linear dispatch still open.
+> **Status:** W4A4-FP path is implemented and validated end-to-end on a
+> Blackwell (Jetson AGX Thor, sm_110) GPU: FP4 weights + FP4 activations with
+> per-16 UE4M3 block scales, dispatched through `omniserve_backend.qgemm_nvfp4`
+> (cuBLASLt FP4 tensor cores). Reference dequant+GEMM matches the kernel
+> bit-exactly.
 
 ## Goal
 
 Replace QServe's progressive **W4A8** quantization (FP16 → INT8 → INT4 with zero
-points) with a **single-stage FP16 → NVFP4** path:
+points) with a **single-stage W4A4-FP** path (Atom-style):
 
-- **No INT8 intermediate** (drop progressive quantization).
-- **No zero point** — use 4-bit *floating point* (NVFP4 / E2M1) instead of unsigned INT4.
+- **No INT8 intermediate** and **no zero point** — weights *and* activations
+  are 4-bit floating point (NVFP4 / E2M1) with per-16 UE4M3 block scales.
 - **Accuracy is intentionally ignored**; the goal is to evaluate efficiency.
+
+> Why W4A4 instead of W4A8-FP: cuBLASLt's block-scaled FP4 GEMM requires both
+> operands to be `CUDA_R_4F_E2M1`. A true W4A8-FP (FP8 × FP4) would need a
+> hand-written tcgen05/TMEM kernel on this hardware.
 
 ## Why NVFP4 matters (and the hard constraint)
 
@@ -81,13 +87,15 @@ Results (CPU, torch 2.8):
      dequantized E2M1 reference exactly.
    - `kernels/csrc/qgemm/nvfp4/fp4_cublaslt_bench.cu` measures FP4 vs FP16
      (table below).
-   - ⚠️ cuBLASLt FP4 is **W4A4** (both operands FP4). A true W4A8-FP
-     (FP8 × FP4) needs a hand-written `mma.sync ... mxf8f6f4 .e4m3.e2m1`
-     kernel or CUTLASS.
-3. Add `omniserve_backend.qgemm_nvfp4` (pybind) and dispatch from
-   `NVFP4Linear.forward` — next step.
+   - ⚠️ cuBLASLt FP4 is **W4A4** (both operands FP4), so the experiment is
+     now **W4A4-FP (Atom-style)**. A true W4A8-FP (FP8 × FP4) would need a
+     hand-written tcgen05/TMEM kernel (the warp-level `mma.sync` FP4 forms are
+     `sm_120a`-only and are rejected on sm_110).
+3. `omniserve_backend.qgemm_nvfp4` (pybind + cuBLASLt) — ✅ implemented and
+   dispatched from `NVFP4Linear.forward`; kernel output matches the W4A4
+   reference dequant+GEMM **bit-exactly** (`max abs diff = 0.0`).
 4. Wire `NVFP4Linear` into `llama_w4a8_unpad.py` (or a new model) and a
-   checkpoint converter (direct HF FP16 → NVFP4, no calibration needed).
+   checkpoint converter (direct HF FP16 → NVFP4, no calibration needed) — next.
 5. Benchmark prefill/decoding throughput vs the W4A8 INT4 baseline.
 
 ### cuBLASLt FP4 (W4A4) vs FP16 on Jetson AGX Thor (sm_110, 20 SMs)

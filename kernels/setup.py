@@ -311,6 +311,20 @@ qgemm_w4a8_per_group_extension = CUDAExtension(
 )
 ext_modules.append(qgemm_w4a8_per_group_extension)
 
+qgemm_nvfp4_extension = CUDAExtension(
+    name="omniserve_backend.qgemm_nvfp4",
+    sources=[
+        "csrc/qgemm/nvfp4/pybind.cpp",
+        "csrc/qgemm/nvfp4/gemm_cuda.cu",
+    ],
+    extra_compile_args={
+        "cxx": CXX_FLAGS,
+        "nvcc": NVCC_FLAGS,
+    },
+    libraries=["cublasLt", "cublas"],
+)
+ext_modules.append(qgemm_nvfp4_extension)
+
 # Fuse kernels.
 fused_extension = CUDAExtension(
     name="omniserve_backend.fused_kernels",

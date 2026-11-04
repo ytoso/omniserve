@@ -94,6 +94,20 @@ def test_weight_quant_roundtrip():
     assert rel_err < 0.5
 
 
+def test_abs_quant_roundtrip():
+    torch.manual_seed(2)
+    x = torch.randn(32, 64)
+    q, scale = nvfp4.quantize_nvfp4_abs(x, block_size=16)
+    assert q.shape == (32, 32)
+    assert scale.shape == (32, 4)
+    deq = nvfp4.dequantize_nvfp4_abs(q, scale)
+    abs_err = (deq - x).abs().max().item()
+    rel_err = abs_err / x.abs().max().item()
+    print(f"[test_abs_quant_roundtrip] max abs err = {abs_err:.3f}, "
+          f"scale-rel err = {rel_err:.3f}")
+    assert rel_err < 0.5
+
+
 def test_linear():
     torch.manual_seed(1)
     lin = torch.nn.Linear(128, 64, bias=True)
@@ -103,8 +117,8 @@ def test_linear():
     y_q = q(x)
     diff = (y_q.float() - y_ref.float()).abs()
     rel = (diff.norm() / y_ref.float().norm()).item()
-    print(f"[test_linear] relative output error = {rel:.3f}")
-    assert rel < 0.3
+    print(f"[test_linear] W4A4 relative output error = {rel:.3f}")
+    assert rel < 0.6
 
 
 def _run_all():

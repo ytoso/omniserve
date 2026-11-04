@@ -169,3 +169,50 @@ def dequantize_weight_nvfp4(qweight: torch.Tensor, scale_fp8: torch.Tensor,
     block_size = (qweight.shape[1] * 2) // scale_fp8.shape[1]
     scale = scale.repeat_interleave(block_size, dim=-1)
     return w_fp4 * scale * global_scale
+
+
+# ---------------------------------------------------------------------------
+# W4A4 (Atom-style) helpers.
+#
+# cuBLASLt block-scaled FP4 GEMM requires *both* operands to be
+# ``CUDA_R_4F_E2M1`` with per-16 ``UE4M3`` block scales. The absolute-scale
+# helpers below match that contract: ``x = e2m1(q) * e4m3(scale)`` with
+# ``scale = block_absmax / 6`` for each 16-element block along the last dim.
+# ---------------------------------------------------------------------------
+
+
+def quantize_nvfp4_abs(w: torch.Tensor, block_size: int = 16):
+    """Quantize a ``[..., K]`` float tensor to NVFP4 with absolute UE4M3 scales.
+
+    Returns
+    -------
+    q : uint8 ``[..., K // 2]`` (2 E2M1 values per byte, low nibble first)
+    scale : uint8 ``[..., K // block_size]`` (UE4M3 per-block scales, sign bit 0)
+
+    Dequantization is ``x = e2m1(q) * e4m3(scale)``.
+    """
+    x = w.float()
+    *lead, K = x.shape
+    if K % block_size != 0:
+        raise ValueError(f"last dim {K} not divisible by block_size {block_size}")
+
+    xr = x.reshape(-1, K // block_size, block_size)
+    block_max = xr.abs().amax(dim=-1, keepdim=True)
+    S = block_max / 6.0
+    scale_fp8 = float_to_e4m3(S).reshape(*lead, K // block_size)
+    S_deq = e4m3_to_float(scale_fp8).reshape(-1, K // block_size, 1).clamp(
+        min=1e-12
+    )
+    fp4 = float_to_e2m1(xr / S_deq)
+    q = pack_e2m1(fp4.reshape(*lead, K))
+    return q, scale_fp8
+
+
+def dequantize_nvfp4_abs(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Reconstruct ``[..., K]`` floats from ``q`` (``[..., K/2]``) and
+    ``scale`` (``[..., K/block_size]``)."""
+    nibbles = unpack_e2m1(q)
+    S = e4m3_to_float(scale)
+    block_size = (q.shape[-1] * 2) // scale.shape[-1]
+    S = S.repeat_interleave(block_size, dim=-1)
+    return e2m1_to_float(nibbles) * S

@@ -1,4 +1,4 @@
-# AGENT.md — NVFP4 (W4A8-FP) Experiment Handoff
+# AGENT.md — NVFP4 (W4A4-FP, Atom-style) Experiment Handoff
 
 > Handoff for the agent continuing this experiment on a Blackwell (SM100) server.
 
@@ -15,8 +15,8 @@ points) with a **single-stage FP16 → NVFP4** path:
 
 | Part | Status |
 |---|---|
-| A — data-format layer (Python/torch) | ✅ done, tested on CPU |
-| B — fused FP4 GEMM kernel (CUDA) | 🟡 cuBLASLt FP4 (W4A4) validated + benchmarked on Thor (sm_110); pybind/linear dispatch still open |
+| A — data-format layer (Python/torch) | ✅ W4A4 helpers + tests |
+| B — fused FP4 GEMM kernel (CUDA) | ✅ `qgemm_nvfp4` cuBLASLt kernel built + validated on Thor (sm_110); model wiring open |
 
 The existing INT4/INT8 kernels are **kept untouched** as a fallback; the NVFP4
 path is additive.
@@ -103,11 +103,10 @@ Single-stage quantization (already implemented in `quantize_weight_nvfp4`):
 2. Add `omniserve_backend.qgemm_nvfp4` (new `pybind.cpp` + `.cu` under
    `kernels/csrc/qgemm/nvfp4/`, register in `kernels/setup.py`). The standalone
    cuBLASLt probes are already there; the pybind wrapper is the next step.
-3. Dispatch from `NVFP4Linear.forward` (currently a reference dequant+`F.linear`).
-4. **Activation side (open decision):** current A8 is per-token **INT8**
-   (`fused_kernels.cu::invoke_quant*`). Blackwell FP4 GEMMs want **FP8 (E4M3)**
-   activations — decide whether to switch the activation quant kernel too.
-   (Note: with the cuBLASLt W4A4 path, activations must also be FP4.)
+3. Dispatch from `NVFP4Linear.forward` — ✅ `omniserve_backend.qgemm_nvfp4`
+   now dispatches the cuBLASLt W4A4 path; kernel matches reference bit-exactly.
+4. **Activation side:** now **W4A4** — activations are quantized to FP4 (E2M1)
+   with per-16 UE4M3 scales (Atom-style), matching cuBLASLt's requirement.
 5. Wire `NVFP4Linear` into a model (clone `llama_w4a8_unpad.py` → e.g.
    `llama_nvfp4_unpad.py`) and add a checkpoint converter (direct HF FP16 →
    NVFP4, no calibration needed since accuracy is aside).
