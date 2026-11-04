@@ -13,8 +13,13 @@ Python/pybind layer.
 - Important finding: **cuBLASLt's block-scaled FP4 kernels require A == B ==
   `CUDA_R_4F_E2M1`** (both operands FP4). FP8 (E4M3) × FP4 (E2M1) is *not*
   exposed by cuBLASLt. So the cuBLASLt path is **W4A4-FP**, not W4A8-FP.
-  A true W4A8-FP (FP8 activations × FP4 weights) would need a hand-written
-  `mma.sync ... kind::mxf8f6f4 ... .e4m3.e2m1 ...` kernel or CUTLASS.
+- Verified with CUDA 13.2 ptxas: the warp-level `mma.sync` FP4-family
+  instructions (`kind::mxf4nvf4` and `kind::mxf8f6f4 ... .e4m3.e2m1`) are
+  **`sm_120a`-only**. They are rejected for `sm_100`/`sm_110`/`sm_120`(non-a)/
+  `sm_121`. On this Thor (`sm_110`) FP4 tensor cores are only reachable through
+  **tcgen05** (5th-gen tensor cores), which is exactly what cuBLASLt uses
+  internally. So a hand-written FP4 kernel on Thor would be a tcgen05/TMEM
+  effort, not an `mma.sync` port of `w4a8_per_*`.
 
 ## Files
 

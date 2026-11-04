@@ -96,6 +96,10 @@ Single-stage quantization (already implemented in `quantize_weight_nvfp4`):
    - ⚠️ **cuBLASLt FP4 = W4A4** (A and B both FP4). cuBLASLt does **not**
      expose FP8 (E4M3) × FP4 (E2M1). A true W4A8-FP needs a hand-written
      `mma.sync ... kind::mxf8f6f4 ... .e4m3.e2m1 ...` kernel (or CUTLASS).
+   - ⚠️ CUDA 13.2 ptxas only accepts those warp-level `mma.sync` FP4 forms on
+     **`sm_120a`**; they are rejected on `sm_100`/`sm_110`/`sm_120`/`sm_121`.
+     On this Thor (`sm_110`) FP4 tensor cores are reachable only via
+     **tcgen05** (5th-gen tensor cores) — i.e., what cuBLASLt uses internally.
 2. Add `omniserve_backend.qgemm_nvfp4` (new `pybind.cpp` + `.cu` under
    `kernels/csrc/qgemm/nvfp4/`, register in `kernels/setup.py`). The standalone
    cuBLASLt probes are already there; the pybind wrapper is the next step.
