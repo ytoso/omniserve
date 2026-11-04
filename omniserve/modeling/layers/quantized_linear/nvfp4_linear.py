@@ -53,6 +53,10 @@ class NVFP4Linear(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # cuBLASLt's block-scaled FP4 GEMM requires M (and N) to be multiples
+        # of 4. Decode batches (M = 1..3) fall back to the reference path.
+        if x.size(0) % 4 != 0:
+            return self._reference_forward(x)
         try:
             import omniserve_backend.qgemm_nvfp4 as qgemm_nvfp4
 
@@ -60,13 +64,15 @@ class NVFP4Linear(torch.nn.Module):
                 x, self.qweight, self.w_scale, self.bias
             )
         except Exception:
-            # Reference path: W4A4 dequantize + FP32 GEMM.
-            qact, act_scale = quantize_nvfp4_abs(x.float(), self.block_size)
-            x_deq = dequantize_nvfp4_abs(qact, act_scale)
-            w_deq = dequantize_nvfp4_abs(self.qweight, self.w_scale)
-            bias = None if self.bias is None else self.bias.float()
-            out = torch.nn.functional.linear(x_deq, w_deq, bias)
-            return out.to(x.dtype)
+            return self._reference_forward(x)
+
+    def _reference_forward(self, x: torch.Tensor) -> torch.Tensor:
+        qact, act_scale = quantize_nvfp4_abs(x.float(), self.block_size)
+        x_deq = dequantize_nvfp4_abs(qact, act_scale)
+        w_deq = dequantize_nvfp4_abs(self.qweight, self.w_scale)
+        bias = None if self.bias is None else self.bias.float()
+        out = torch.nn.functional.linear(x_deq, w_deq, bias)
+        return out.to(x.dtype)
 
     @classmethod
     def from_linear(cls, linear: torch.nn.Linear, block_size: int = 16) -> "NVFP4Linear":

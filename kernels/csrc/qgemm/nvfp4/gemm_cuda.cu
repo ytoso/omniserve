@@ -356,13 +356,17 @@ at::Tensor gemm_forward_cuda(at::Tensor x, at::Tensor qweight,
   CHECK_CUBLASLT(cublasLtMatmulAlgoGetHeuristic(
       lt, opDesc, Adesc, Bdesc, Cdesc, Ddesc, pref, 1, &heur, &returnedResults));
 
+  // Some heuristics (especially the small-M decode shapes) require workspace.
+  at::Tensor workspace = at::empty(
+      {(int64_t)heur.workspaceSize}, opts_u8);
+
   float alpha = 1.0f, beta = 0.0f;
   void* pA = a_stored.data_ptr();
   void* pB = b_stored.data_ptr();
   void* pC = dC.data_ptr();
   CHECK_CUBLASLT(cublasLtMatmul(lt, opDesc, &alpha, pA, Adesc, pB, Bdesc, &beta,
-                                pC, Ddesc, pC, Ddesc, &heur.algo, nullptr, 0,
-                                stream));
+                                pC, Ddesc, pC, Ddesc, &heur.algo,
+                                workspace.data_ptr(), heur.workspaceSize, stream));
 
   // 7. Transpose output + optional bias.
   at::Tensor out = at::empty({M, OC}, x.options());
