@@ -18,6 +18,8 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 
 #include "gemm_cuda.h"
 
@@ -180,6 +182,16 @@ __global__ void transpose_weight_bytes(const unsigned char* __restrict__ qw,
   b_stored[(size_t)i2 + (size_t)j * K2] = qw[(size_t)j * K2 + i2];
 }
 
+__global__ void output_transpose_f32(const float* __restrict__ dC, int M, int N,
+                                     float* __restrict__ out) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = (size_t)M * N;
+  if (tid >= total) return;
+  int i = tid / N;
+  int j = tid % N;
+  out[(size_t)i * N + j] = dC[(size_t)i + (size_t)j * M];
+}
+
 __global__ void output_kernel_h(const float* __restrict__ dC, int M, int OC,
                                 const __half* __restrict__ bias, int has_bias,
                                 __half* __restrict__ out) {
@@ -307,7 +319,7 @@ void NVFP4GEMM::ensure_plan(int M) {
   auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(at::kCUDA);
   auto opts_f32 = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA);
   plan.a_stored = at::empty({(int64_t)((size_t)M * (K_ / 2))}, opts_u8);
-  plan.a_scales = at::empty(
+  plan.a_scales = at::zeros(
       {(int64_t)((size_t)cdiv(M, 128) * cdiv(K_, 64) * 512)}, opts_u8);
   plan.dC = at::empty({(int64_t)((size_t)M * OC_)}, opts_f32);
   if (plan.heur.workspaceSize > 0) {
@@ -385,5 +397,144 @@ at::Tensor NVFP4GEMM::forward(at::Tensor x) {
   CHECK_CUDA(cudaGetLastError());
 
   if (M_pad != M) out = out.narrow(0, 0, M);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic-activation NVFP4 GEMM (used by NVFP4 attention).
+
+struct ActPlan {
+  cublasLtMatrixLayout_t Adesc = nullptr;
+  cublasLtMatrixLayout_t Bdesc = nullptr;
+  cublasLtMatrixLayout_t Cdesc = nullptr;
+  cublasLtMatrixLayout_t Ddesc = nullptr;
+  cublasLtMatmulDesc_t opDesc = nullptr;
+  cublasLtMatmulHeuristicResult_t heur{};
+  at::Tensor workspace;
+};
+static std::unordered_map<std::string, ActPlan> g_act_plans;
+
+// ---------------------------------------------------------------------------
+// Computes C[M, N] = x @ y^T, where both x [M, K] and y [N, K] are quantized
+// to E2M1 with per-16 UE4M3 block scales on the fly.
+// ---------------------------------------------------------------------------
+
+static std::tuple<at::Tensor, at::Tensor> quantize_act_for_gemm(
+    at::Tensor a, int outer, int inner, cudaStream_t stream) {
+  // a is [outer, inner], fp16 or fp32. Returns [a_stored, a_scales].
+  auto opts_u8 = a.options().dtype(at::kByte);
+  at::Tensor a_stored =
+      at::empty({(int64_t)((size_t)outer * (inner / 2))}, opts_u8);
+  at::Tensor a_scales = at::zeros(
+      {(int64_t)((size_t)cdiv(outer, 128) * cdiv(inner, 64) * 512)}, opts_u8);
+  int threads = 256;
+  int total = outer * (inner / 16);
+  if (a.scalar_type() == at::kHalf) {
+    quantize_act_fused<__half><<<cdiv(total, threads), threads, 0, stream>>>(
+        reinterpret_cast<const __half*>(a.data_ptr<at::Half>()), outer, inner,
+        16, inner / 16, a_scales.data_ptr<unsigned char>(),
+        a_stored.data_ptr<unsigned char>());
+  } else {
+    quantize_act_fused<float><<<cdiv(total, threads), threads, 0, stream>>>(
+        a.data_ptr<float>(), outer, inner, 16, inner / 16,
+        a_scales.data_ptr<unsigned char>(), a_stored.data_ptr<unsigned char>());
+  }
+  CHECK_CUDA(cudaGetLastError());
+  return std::make_tuple(a_stored, a_scales);
+}
+
+at::Tensor gemm_act_forward_cuda(at::Tensor x, at::Tensor y) {
+  TORCH_CHECK(x.is_cuda() && y.is_cuda(), "x/y must be CUDA tensors");
+  TORCH_CHECK(x.dim() == 2 && y.dim() == 2 && x.size(1) == y.size(1),
+              "x [M,K] and y [N,K] expected");
+
+  int M = x.size(0), N = y.size(0), K = x.size(1);
+  int M_pad = ((M + 3) / 4) * 4;
+  int N_pad = ((N + 3) / 4) * 4;
+
+  c10::cuda::CUDAGuard guard(x.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  at::Tensor x_c = x.contiguous();
+  if (M_pad != M) {
+    at::Tensor p = at::zeros({M_pad, K}, x_c.options());
+    p.narrow(0, 0, M).copy_(x_c);
+    x_c = p;
+  }
+  at::Tensor y_c = y.contiguous();
+  if (N_pad != N) {
+    at::Tensor p = at::zeros({N_pad, K}, y_c.options());
+    p.narrow(0, 0, N).copy_(y_c);
+    y_c = p;
+  }
+
+  auto [a_stored, a_scales] = quantize_act_for_gemm(x_c, M_pad, K, stream);
+  auto [b_stored, b_scales] = quantize_act_for_gemm(y_c, N_pad, K, stream);
+
+  static cublasLtHandle_t lt = nullptr;
+  if (!lt) CHECK_CUBLASLT(cublasLtCreate(&lt));
+  std::string key = std::to_string(M_pad) + "_" + std::to_string(N_pad) + "_" + std::to_string(K);
+  ActPlan* plan;
+  auto it = g_act_plans.find(key);
+  if (it == g_act_plans.end()) {
+    ActPlan p;
+    int order_col = CUBLASLT_ORDER_COL;
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Adesc, CUDA_R_4F_E2M1, K, M_pad, K));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Bdesc, CUDA_R_4F_E2M1, K, N_pad, K));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Cdesc, CUDA_R_32F, M_pad, N_pad, M_pad));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Ddesc, CUDA_R_32F, M_pad, N_pad, M_pad));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutSetAttribute(p.Adesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_col, sizeof(order_col)));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutSetAttribute(p.Bdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_col, sizeof(order_col)));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutSetAttribute(p.Cdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_col, sizeof(order_col)));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutSetAttribute(p.Ddesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_col, sizeof(order_col)));
+    CHECK_CUBLASLT(cublasLtMatmulDescCreate(&p.opDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    cublasOperation_t opA = CUBLAS_OP_T, opB = CUBLAS_OP_N;
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(p.opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(p.opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+    cublasLtMatmulMatrixScale_t smode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(p.opDesc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &smode, sizeof(smode)));
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(p.opDesc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &smode, sizeof(smode)));
+    void* pA_s0 = a_scales.data_ptr();
+    void* pB_s0 = b_scales.data_ptr();
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(p.opDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &pA_s0, sizeof(pA_s0)));
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(p.opDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &pB_s0, sizeof(pB_s0)));
+    cublasLtMatmulPreference_t pref = nullptr;
+    CHECK_CUBLASLT(cublasLtMatmulPreferenceCreate(&pref));
+    int ret = 0;
+    CHECK_CUBLASLT(cublasLtMatmulAlgoGetHeuristic(lt, p.opDesc, p.Adesc, p.Bdesc, p.Cdesc, p.Ddesc, pref, 1, &p.heur, &ret));
+    cublasLtMatmulPreferenceDestroy(pref);
+    if (p.heur.workspaceSize > 0) {
+      p.workspace = at::empty({(int64_t)p.heur.workspaceSize}, x.options().dtype(at::kByte));
+    }
+    g_act_plans[key] = p;
+    plan = &g_act_plans[key];
+  } else {
+    plan = &it->second;
+  }
+  void* pA_s = a_scales.data_ptr();
+  void* pB_s = b_scales.data_ptr();
+  CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(plan->opDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &pA_s, sizeof(pA_s)));
+  CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(plan->opDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &pB_s, sizeof(pB_s)));
+
+  auto opts_f32 = x.options().dtype(at::kFloat);
+  at::Tensor dC = at::empty({(int64_t)((size_t)M_pad * N_pad)}, opts_f32);
+  void* ws = plan->workspace.defined() ? plan->workspace.data_ptr() : nullptr;
+  float alpha = 1.0f, beta = 0.0f;
+  void* pA = a_stored.data_ptr();
+  void* pB = b_stored.data_ptr();
+  void* pC = dC.data_ptr();
+  CHECK_CUBLASLT(cublasLtMatmul(lt, plan->opDesc, &alpha, pA, plan->Adesc, pB,
+                                plan->Bdesc, &beta, pC, plan->Ddesc, pC,
+                                plan->Ddesc, &plan->heur.algo, ws,
+                                plan->heur.workspaceSize, stream));
+
+  at::Tensor out = at::empty({M_pad, N_pad}, opts_f32);
+  int threads = 256;
+  int total = (size_t)M_pad * N_pad;
+  output_transpose_f32<<<cdiv(total, threads), threads, 0, stream>>>(
+      dC.data_ptr<float>(), M_pad, N_pad, out.data_ptr<float>());
+  CHECK_CUDA(cudaGetLastError());
+
+  if (M_pad != M || N_pad != N) out = out.narrow(0, 0, M).narrow(1, 0, N);
   return out;
 }

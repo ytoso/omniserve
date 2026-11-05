@@ -48,3 +48,5 @@ class NVFP4GEMM {
 
   void ensure_plan(int M);
 };
+
+at::Tensor gemm_act_forward_cuda(at::Tensor x, at::Tensor y);
