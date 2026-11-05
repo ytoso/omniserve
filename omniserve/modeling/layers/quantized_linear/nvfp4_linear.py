@@ -50,19 +50,23 @@ class NVFP4Linear(torch.nn.Module):
             self.register_buffer("bias", torch.zeros(out_features, dtype=torch.float16))
         else:
             self.bias = None
+        self._backend = None
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # cuBLASLt's block-scaled FP4 GEMM requires M (and N) to be multiples
-        # of 4. Decode batches (M = 1..3) fall back to the reference path.
-        if x.size(0) % 4 != 0:
-            return self._reference_forward(x)
         try:
             import omniserve_backend.qgemm_nvfp4 as qgemm_nvfp4
 
-            return qgemm_nvfp4.gemm_forward_cuda(
-                x, self.qweight, self.w_scale, self.bias
-            )
+            if self._backend is None:
+                qweight = self.qweight
+                w_scale = self.w_scale
+                if not qweight.is_cuda:
+                    qweight = qweight.cuda()
+                    w_scale = w_scale.cuda()
+                self._backend = qgemm_nvfp4.NVFP4GEMM(
+                    qweight, w_scale, self.bias
+                )
+            return self._backend.forward(x)
         except Exception:
             return self._reference_forward(x)
 

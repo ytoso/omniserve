@@ -6,6 +6,7 @@
 #include "gemm_cuda.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("gemm_forward_cuda", &gemm_forward_cuda,
-        "NVFP4 W4A4 GEMM (cuBLASLt FP4 tensor cores)");
+  pybind11::class_<NVFP4GEMM>(m, "NVFP4GEMM")
+      .def(pybind11::init<at::Tensor, at::Tensor, c10::optional<at::Tensor>>())
+      .def("forward", &NVFP4GEMM::forward);
 }
