@@ -14,11 +14,10 @@ from transformers import LlamaConfig
 from omniserve.modeling.models.llama_nvfp4_unpad import LlamaForCausalLM
 
 
-def build_models(config, device):
+def build_models(config, device, use_nvfp4_attn=False):
     torch.manual_seed(0)
     fp16 = LlamaForCausalLM(config).to(device).half().eval()
-    # Clone the fp16 weights into a fresh model, then quantize linears to NVFP4.
-    nvfp4 = LlamaForCausalLM(config).to(device).half().eval()
+    nvfp4 = LlamaForCausalLM(config, use_nvfp4_attn=use_nvfp4_attn).to(device).half().eval()
     nvfp4.load_state_dict(fp16.state_dict())
     nvfp4.replace_linears_with_nvfp4()
     return fp16, nvfp4
@@ -70,18 +69,16 @@ def main():
     )
     print("building models ...")
     fp16, nvfp4 = build_models(config, device)
+    _, nvfp4_attn = build_models(config, device, use_nvfp4_attn=True)
     n_params = sum(p.numel() for p in fp16.parameters()) / 1e9
     print(f"params: {n_params:.2f}B")
 
     input_ids = torch.randint(0, args.vocab_size, (args.prefill_len,), device=device)
 
-    # warmup
-    for _ in range(args.warmup):
-        run_prefill(fp16, input_ids)
-        run_prefill(nvfp4, input_ids)
-    torch.cuda.synchronize()
-
     def bench_prefill(model):
+        for _ in range(args.warmup):
+            run_prefill(model, input_ids)
+        torch.cuda.synchronize()
         ts = []
         for _ in range(args.runs):
             t0 = time.perf_counter()
@@ -92,19 +89,26 @@ def main():
 
     fp16_ms = bench_prefill(fp16)
     nvfp4_ms = bench_prefill(nvfp4)
-    print(f"\nprefill len={args.prefill_len}: fp16 {fp16_ms:.2f} ms | "
-          f"nvfp4 {nvfp4_ms:.2f} ms | speedup {fp16_ms/nvfp4_ms:.2f}x")
+    nvfp4_attn_ms = bench_prefill(nvfp4_attn)
+    print(f"\nprefill len={args.prefill_len}:")
+    print(f"  fp16        {fp16_ms:.2f} ms")
+    print(f"  nvfp4       {nvfp4_ms:.2f} ms  ({fp16_ms/nvfp4_ms:.2f}x)")
+    print(f"  nvfp4+attn  {nvfp4_attn_ms:.2f} ms  ({fp16_ms/nvfp4_attn_ms:.2f}x)")
 
-    # decode
-    for _ in range(args.warmup):
-        run_decode(fp16, input_ids[:1], args.decode_steps)
-        run_decode(nvfp4, input_ids[:1], args.decode_steps)
-    fp16_lat = run_decode(fp16, input_ids[:1], args.decode_steps)
-    nvfp4_lat = run_decode(nvfp4, input_ids[:1], args.decode_steps)
-    fp16_avg = sum(fp16_lat) / len(fp16_lat)
-    nvfp4_avg = sum(nvfp4_lat) / len(nvfp4_lat)
-    print(f"decode: fp16 {fp16_avg:.2f} ms/tok | nvfp4 {nvfp4_avg:.2f} ms/tok | "
-          f"speedup {fp16_avg/nvfp4_avg:.2f}x")
+    def bench_decode(model):
+        for _ in range(args.warmup):
+            run_decode(model, input_ids[:1], args.decode_steps)
+        torch.cuda.synchronize()
+        lat = run_decode(model, input_ids[:1], args.decode_steps)
+        return sum(lat) / len(lat)
+
+    fp16_lat = bench_decode(fp16)
+    nvfp4_lat = bench_decode(nvfp4)
+    nvfp4_attn_lat = bench_decode(nvfp4_attn)
+    print(f"decode:")
+    print(f"  fp16        {fp16_lat:.2f} ms/tok")
+    print(f"  nvfp4       {nvfp4_lat:.2f} ms/tok  ({fp16_lat/nvfp4_lat:.2f}x)")
+    print(f"  nvfp4+attn  {nvfp4_attn_lat:.2f} ms/tok  ({fp16_lat/nvfp4_attn_lat:.2f}x)")
 
 
 if __name__ == "__main__":

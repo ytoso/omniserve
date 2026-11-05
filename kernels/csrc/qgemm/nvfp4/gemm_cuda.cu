@@ -451,6 +451,7 @@ at::Tensor gemm_act_forward_cuda(at::Tensor x, at::Tensor y) {
   int M = x.size(0), N = y.size(0), K = x.size(1);
   int M_pad = ((M + 3) / 4) * 4;
   int N_pad = ((N + 3) / 4) * 4;
+  int K_pad = ((K + 15) / 16) * 16;
 
   c10::cuda::CUDAGuard guard(x.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -461,26 +462,36 @@ at::Tensor gemm_act_forward_cuda(at::Tensor x, at::Tensor y) {
     p.narrow(0, 0, M).copy_(x_c);
     x_c = p;
   }
+  if (K_pad != K) {
+    at::Tensor p = at::zeros({x_c.size(0), K_pad}, x_c.options());
+    p.narrow(1, 0, K).copy_(x_c);
+    x_c = p;
+  }
   at::Tensor y_c = y.contiguous();
   if (N_pad != N) {
     at::Tensor p = at::zeros({N_pad, K}, y_c.options());
     p.narrow(0, 0, N).copy_(y_c);
     y_c = p;
   }
+  if (K_pad != K) {
+    at::Tensor p = at::zeros({y_c.size(0), K_pad}, y_c.options());
+    p.narrow(1, 0, K).copy_(y_c);
+    y_c = p;
+  }
 
-  auto [a_stored, a_scales] = quantize_act_for_gemm(x_c, M_pad, K, stream);
-  auto [b_stored, b_scales] = quantize_act_for_gemm(y_c, N_pad, K, stream);
+  auto [a_stored, a_scales] = quantize_act_for_gemm(x_c, M_pad, K_pad, stream);
+  auto [b_stored, b_scales] = quantize_act_for_gemm(y_c, N_pad, K_pad, stream);
 
   static cublasLtHandle_t lt = nullptr;
   if (!lt) CHECK_CUBLASLT(cublasLtCreate(&lt));
-  std::string key = std::to_string(M_pad) + "_" + std::to_string(N_pad) + "_" + std::to_string(K);
+  std::string key = std::to_string(M_pad) + "_" + std::to_string(N_pad) + "_" + std::to_string(K_pad);
   ActPlan* plan;
   auto it = g_act_plans.find(key);
   if (it == g_act_plans.end()) {
     ActPlan p;
     int order_col = CUBLASLT_ORDER_COL;
-    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Adesc, CUDA_R_4F_E2M1, K, M_pad, K));
-    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Bdesc, CUDA_R_4F_E2M1, K, N_pad, K));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Adesc, CUDA_R_4F_E2M1, K_pad, M_pad, K_pad));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Bdesc, CUDA_R_4F_E2M1, K_pad, N_pad, K_pad));
     CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Cdesc, CUDA_R_32F, M_pad, N_pad, M_pad));
     CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&p.Ddesc, CUDA_R_32F, M_pad, N_pad, M_pad));
     CHECK_CUBLASLT(cublasLtMatrixLayoutSetAttribute(p.Adesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_col, sizeof(order_col)));

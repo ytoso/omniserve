@@ -19,11 +19,13 @@ from transformers import LlamaConfig
 
 from omniserve.modeling.layers.quantized_linear import NVFP4Linear
 from omniserve.modeling.layers.layernorm import RMSNorm
+from omniserve.modeling.layers.nvfp4_attention import NVFP4Attention
 
 
 class LlamaAttention(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False):
         super().__init__()
+        self.use_nvfp4_attn = use_nvfp4_attn
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -35,6 +37,8 @@ class LlamaAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.kv_size, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_size, bias=False)
         self.o_proj = nn.Linear(self.q_size, self.hidden_size, bias=False)
+        if use_nvfp4_attn:
+            self.nvfp4_attn = NVFP4Attention(self.head_dim, causal=True)
 
     def _reshape(self, x: torch.Tensor, heads: int) -> torch.Tensor:
         return x.view(-1, heads, self.head_dim)
@@ -54,15 +58,20 @@ class LlamaAttention(nn.Module):
             v = torch.cat([past_v, v], dim=0)
         new_cache = (k, v)
 
-        # GQA: repeat KV heads to match query heads.
-        n_rep = self.num_heads // self.num_kv_heads
-        k_rep = k.repeat_interleave(n_rep, dim=1)
-        v_rep = v.repeat_interleave(n_rep, dim=1)
-
-        attn = F.scaled_dot_product_attention(
-            q.transpose(0, 1), k_rep.transpose(0, 1), v_rep.transpose(0, 1),
-            is_causal=True,
-        ).transpose(0, 1)
+        # cuBLASLt FP4 GEMM needs K >= 64; for very short contexts (decode)
+        # fall back to the FP16 SDPA path.
+        if self.use_nvfp4_attn and k.size(0) >= 64:
+            causal_start = 0 if kv_cache is None else (k.size(0) - q.size(0))
+            attn = self.nvfp4_attn(q, k, v, causal_start=causal_start)
+        else:
+            # GQA: repeat KV heads to match query heads.
+            n_rep = self.num_heads // self.num_kv_heads
+            k_rep = k.repeat_interleave(n_rep, dim=1)
+            v_rep = v.repeat_interleave(n_rep, dim=1)
+            attn = F.scaled_dot_product_attention(
+                q.transpose(0, 1), k_rep.transpose(0, 1), v_rep.transpose(0, 1),
+                is_causal=True,
+            ).transpose(0, 1)
 
         out = self.o_proj(attn.reshape(-1, self.q_size))
         return out, new_cache
@@ -81,9 +90,9 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False):
         super().__init__()
-        self.self_attn = LlamaAttention(config)
+        self.self_attn = LlamaAttention(config, use_nvfp4_attn=use_nvfp4_attn)
         self.mlp = LlamaMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -101,12 +110,13 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaModel(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [LlamaDecoderLayer(config, use_nvfp4_attn=use_nvfp4_attn)
+             for _ in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -122,10 +132,10 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLM(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False):
         super().__init__()
         self.config = config
-        self.model = LlamaModel(config)
+        self.model = LlamaModel(config, use_nvfp4_attn=use_nvfp4_attn)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(self, input_ids: torch.Tensor, kv_caches=None):
