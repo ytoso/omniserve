@@ -80,6 +80,9 @@ __device__ __forceinline__ unsigned e4m3_encode(float x) {
   return bits;
 }
 
+__device__ __forceinline__ float to_float(float v) { return v; }
+__device__ __forceinline__ float to_float(__half v) { return __half2float(v); }
+
 __device__ __forceinline__ float e4m3_decode(unsigned b) {
   int sign = (b >> 7) & 1;
   int exp = (b >> 3) & 0xF;
@@ -100,7 +103,8 @@ __device__ __forceinline__ float e4m3_decode(unsigned b) {
 // Fused activation quantization: one thread per (row, 16-element block).
 // Computes the UE4M3 scale, writes it directly into cuBLASLt's tiled layout,
 // and writes the E2M1 packed values into the transposed A operand.
-__global__ void quantize_act_fused(const float* __restrict__ x, int M, int K,
+template <typename T>
+__global__ void quantize_act_fused(const T* __restrict__ x, int M, int K,
                                    int block_size, int nblocks,
                                    unsigned char* __restrict__ a_scales,
                                    unsigned char* __restrict__ a_stored) {
@@ -110,11 +114,14 @@ __global__ void quantize_act_fused(const float* __restrict__ x, int M, int K,
 
   int j = tid / nblocks;
   int b = tid % nblocks;
-  const float* row = x + (size_t)j * K;
+  const T* row = x + (size_t)j * K;
   int start = b * block_size;
 
   float mx = 0.0f;
-  for (int e = 0; e < block_size; e++) mx = fmaxf(mx, fabsf(row[start + e]));
+  for (int e = 0; e < block_size; e++) {
+    float v = to_float(row[start + e]);
+    mx = fmaxf(mx, fabsf(v));
+  }
   unsigned s = (mx == 0.0f) ? 0x01u : e4m3_encode(mx / 6.0f);
   float S = e4m3_decode(s);
   if (S < 1e-12f) S = 1e-12f;
@@ -131,8 +138,8 @@ __global__ void quantize_act_fused(const float* __restrict__ x, int M, int K,
   int K2 = K / 2;
   unsigned char* dst = a_stored + (size_t)j * K2 + start / 2;
   for (int e = 0; e < block_size; e += 2) {
-    unsigned lo = e2m1_encode(row[start + e] / S);
-    unsigned hi = e2m1_encode(row[start + e + 1] / S);
+    unsigned lo = e2m1_encode(to_float(row[start + e]) / S);
+    unsigned hi = e2m1_encode(to_float(row[start + e + 1]) / S);
     dst[e / 2] = (unsigned char)(lo | (hi << 4));
   }
 }
@@ -316,25 +323,33 @@ at::Tensor NVFP4GEMM::forward(at::Tensor x) {
   int M = x.size(0);
   int M_pad = ((M + 3) / 4) * 4;
 
-  at::Tensor x_f = x.to(at::kFloat).contiguous();
-  if (M_pad != M) {
-    at::Tensor padded = at::zeros({M_pad, K_}, x_f.options());
-    padded.narrow(0, 0, M).copy_(x_f);
-    x_f = padded;
-  }
-
   c10::cuda::CUDAGuard guard(x.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   ensure_plan(M_pad);
   NVFP4Plan& plan = plans_[M_pad];
 
+  at::Tensor x_c = x.contiguous();
+  at::Tensor x_pad;
+  if (M_pad != M) {
+    x_pad = at::zeros({M_pad, K_}, x_c.options());
+    x_pad.narrow(0, 0, M).copy_(x_c);
+    x_c = x_pad;
+  }
+
   int threads = 256;
   int total = M_pad * (K_ / 16);
-  quantize_act_fused<<<cdiv(total, threads), threads, 0, stream>>>(
-      x_f.data_ptr<float>(), M_pad, K_, 16, K_ / 16,
-      plan.a_scales.data_ptr<unsigned char>(),
-      plan.a_stored.data_ptr<unsigned char>());
+  if (x_c.scalar_type() == at::kHalf) {
+    quantize_act_fused<__half><<<cdiv(total, threads), threads, 0, stream>>>(
+        reinterpret_cast<const __half*>(x_c.data_ptr<at::Half>()), M_pad, K_, 16,
+        K_ / 16, plan.a_scales.data_ptr<unsigned char>(),
+        plan.a_stored.data_ptr<unsigned char>());
+  } else {
+    quantize_act_fused<float><<<cdiv(total, threads), threads, 0, stream>>>(
+        x_c.data_ptr<float>(), M_pad, K_, 16, K_ / 16,
+        plan.a_scales.data_ptr<unsigned char>(),
+        plan.a_stored.data_ptr<unsigned char>());
+  }
   CHECK_CUDA(cudaGetLastError());
 
   void* pA_scales = plan.a_scales.data_ptr();
