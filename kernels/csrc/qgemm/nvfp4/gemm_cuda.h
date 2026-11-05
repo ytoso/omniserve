@@ -19,6 +19,10 @@ struct NVFP4Plan {
   cublasLtMatrixLayout_t Ddesc = nullptr;
   cublasLtMatmulDesc_t opDesc = nullptr;
   cublasLtMatmulHeuristicResult_t heur{};
+  at::Tensor a_stored;
+  at::Tensor a_scales;
+  at::Tensor dC;
+  at::Tensor workspace;
 };
 
 class NVFP4GEMM {
@@ -42,5 +46,5 @@ class NVFP4GEMM {
   cublasLtMatrixLayout_t Bdesc_ = nullptr;
   std::unordered_map<int, NVFP4Plan> plans_;
 
-  void ensure_plan(int M, void* a_scales_ptr);
+  void ensure_plan(int M);
 };

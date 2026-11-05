@@ -97,20 +97,44 @@ __device__ __forceinline__ float e4m3_decode(unsigned b) {
 // Kernels
 // ---------------------------------------------------------------------------
 
-__global__ void compute_act_scales(const float* __restrict__ x, int M, int K,
+// Fused activation quantization: one thread per (row, 16-element block).
+// Computes the UE4M3 scale, writes it directly into cuBLASLt's tiled layout,
+// and writes the E2M1 packed values into the transposed A operand.
+__global__ void quantize_act_fused(const float* __restrict__ x, int M, int K,
                                    int block_size, int nblocks,
-                                   unsigned char* __restrict__ scales) {
+                                   unsigned char* __restrict__ a_scales,
+                                   unsigned char* __restrict__ a_stored) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int total = M * nblocks;
   if (tid >= total) return;
+
   int j = tid / nblocks;
   int b = tid % nblocks;
   const float* row = x + (size_t)j * K;
   int start = b * block_size;
+
   float mx = 0.0f;
   for (int e = 0; e < block_size; e++) mx = fmaxf(mx, fabsf(row[start + e]));
   unsigned s = (mx == 0.0f) ? 0x01u : e4m3_encode(mx / 6.0f);
-  scales[(size_t)j * nblocks + b] = (unsigned char)s;
+  float S = e4m3_decode(s);
+  if (S < 1e-12f) S = 1e-12f;
+
+  // Tiled VEC16_UE4M3 scale layout.
+  int tiles_inner = (nblocks + 3) / 4;
+  int o = j % 128;
+  int c = b % 4;
+  int off = (o % 32) * 16 + (o / 32) * 4 + c;
+  int tiled_idx = ((j / 128) * tiles_inner + (b / 4)) * 512 + off;
+  a_scales[tiled_idx] = (unsigned char)s;
+
+  // Transposed/packed A operand: byte (i + j*K)/2, i in [start, start+16).
+  int K2 = K / 2;
+  unsigned char* dst = a_stored + (size_t)j * K2 + start / 2;
+  for (int e = 0; e < block_size; e += 2) {
+    unsigned lo = e2m1_encode(row[start + e] / S);
+    unsigned hi = e2m1_encode(row[start + e + 1] / S);
+    dst[e / 2] = (unsigned char)(lo | (hi << 4));
+  }
 }
 
 __global__ void tile_scales(const unsigned char* __restrict__ simple, int outer,
@@ -136,35 +160,6 @@ __global__ void tile_scales(const unsigned char* __restrict__ simple, int outer,
     v = simple[(size_t)mat_o * (inner / block_size) + mat_b];
   }
   tiled[tid] = v;
-}
-
-__global__ void quantize_act_stored(const float* __restrict__ x, int M, int K,
-                                    int block_size,
-                                    const unsigned char* __restrict__ scales,
-                                    unsigned char* __restrict__ a_stored) {
-  int K2 = K / 2;
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = (size_t)M * K2;
-  if (tid >= total) return;
-
-  int j = tid / K2;
-  int i2 = tid % K2;
-  int i = i2 * 2;
-  int b0 = i / block_size;
-  int b1 = (i + 1) / block_size;
-  const float* row = x + (size_t)j * K;
-  float mx0 = 0.0f, mx1 = 0.0f;
-  for (int e = 0; e < block_size; e++) {
-    mx0 = fmaxf(mx0, fabsf(row[b0 * block_size + e]));
-    mx1 = fmaxf(mx1, fabsf(row[b1 * block_size + e]));
-  }
-  float S0f = e4m3_decode(e4m3_encode(mx0 / 6.0f));
-  float S1f = e4m3_decode(e4m3_encode(mx1 / 6.0f));
-  if (S0f < 1e-12f) S0f = 1e-12f;
-  if (S1f < 1e-12f) S1f = 1e-12f;
-  unsigned lo = e2m1_encode(row[i] / S0f);
-  unsigned hi = e2m1_encode(row[i + 1] / S1f);
-  a_stored[(size_t)j * K2 + i2] = (unsigned char)(lo | (hi << 4));
 }
 
 __global__ void transpose_weight_bytes(const unsigned char* __restrict__ qw,
@@ -260,7 +255,7 @@ NVFP4GEMM::~NVFP4GEMM() {
   if (lt_) cublasLtDestroy(lt_);
 }
 
-void NVFP4GEMM::ensure_plan(int M, void* a_scales_ptr) {
+void NVFP4GEMM::ensure_plan(int M) {
   NVFP4Plan plan;
   int order_col = CUBLASLT_ORDER_COL;
   CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&plan.Adesc, CUDA_R_4F_E2M1, K_, M, K_));
@@ -282,9 +277,10 @@ void NVFP4GEMM::ensure_plan(int M, void* a_scales_ptr) {
       plan.opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
   cublasLtMatmulMatrixScale_t smode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
   void* pB = b_scales_.data_ptr();
+  void* pA_dummy = pB;
   CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
-      plan.opDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scales_ptr,
-      sizeof(a_scales_ptr)));
+      plan.opDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &pA_dummy,
+      sizeof(pA_dummy)));
   CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
       plan.opDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &pB, sizeof(pB)));
   CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
@@ -299,6 +295,17 @@ void NVFP4GEMM::ensure_plan(int M, void* a_scales_ptr) {
       lt_, plan.opDesc, plan.Adesc, Bdesc_, plan.Cdesc, plan.Ddesc, pref, 1,
       &plan.heur, &ret));
   cublasLtMatmulPreferenceDestroy(pref);
+
+  // Reusable per-M workspace/buffers.
+  auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(at::kCUDA);
+  auto opts_f32 = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA);
+  plan.a_stored = at::empty({(int64_t)((size_t)M * (K_ / 2))}, opts_u8);
+  plan.a_scales = at::empty(
+      {(int64_t)((size_t)cdiv(M, 128) * cdiv(K_, 64) * 512)}, opts_u8);
+  plan.dC = at::empty({(int64_t)((size_t)M * OC_)}, opts_f32);
+  if (plan.heur.workspaceSize > 0) {
+    plan.workspace = at::empty({(int64_t)plan.heur.workspaceSize}, opts_u8);
+  }
   plans_[M] = plan;
 }
 
@@ -319,67 +326,42 @@ at::Tensor NVFP4GEMM::forward(at::Tensor x) {
   c10::cuda::CUDAGuard guard(x.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  auto opts_u8 = x.options().dtype(at::kByte);
-  auto opts_f32 = x.options().dtype(at::kFloat);
-  at::Tensor a_stored =
-      at::empty({(int64_t)((size_t)M_pad * (K_ / 2))}, opts_u8);
-  at::Tensor act_scales_simple =
-      at::empty({M_pad, K_ / 16}, opts_u8);
-  at::Tensor a_scales = at::empty(
-      {(int64_t)((size_t)cdiv(M_pad, 128) * cdiv(K_, 64) * 512)}, opts_u8);
-  at::Tensor dC = at::empty({(int64_t)((size_t)M_pad * OC_)}, opts_f32);
-  ensure_plan(M_pad, a_scales.data_ptr());
+  ensure_plan(M_pad);
   NVFP4Plan& plan = plans_[M_pad];
 
   int threads = 256;
-  {
-    int total = M_pad * (K_ / 16);
-    compute_act_scales<<<cdiv(total, threads), threads, 0, stream>>>(
-        x_f.data_ptr<float>(), M_pad, K_, 16, K_ / 16,
-        act_scales_simple.data_ptr<unsigned char>());
-  }
-  int total = cdiv(M_pad, 128) * cdiv(K_, 64) * 512;
-  tile_scales<<<cdiv(total, threads), threads, 0, stream>>>(
-      act_scales_simple.data_ptr<unsigned char>(), M_pad, K_, 16,
-      a_scales.data_ptr<unsigned char>());
-  total = (size_t)M_pad * (K_ / 2);
-  quantize_act_stored<<<cdiv(total, threads), threads, 0, stream>>>(
-      x_f.data_ptr<float>(), M_pad, K_, 16,
-      act_scales_simple.data_ptr<unsigned char>(),
-      a_stored.data_ptr<unsigned char>());
+  int total = M_pad * (K_ / 16);
+  quantize_act_fused<<<cdiv(total, threads), threads, 0, stream>>>(
+      x_f.data_ptr<float>(), M_pad, K_, 16, K_ / 16,
+      plan.a_scales.data_ptr<unsigned char>(),
+      plan.a_stored.data_ptr<unsigned char>());
   CHECK_CUDA(cudaGetLastError());
 
-  void* pA_scales = a_scales.data_ptr();
+  void* pA_scales = plan.a_scales.data_ptr();
   CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
       plan.opDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &pA_scales,
       sizeof(pA_scales)));
 
-  at::Tensor workspace;
-  void* ws_ptr = nullptr;
-  if (plan.heur.workspaceSize > 0) {
-    workspace = at::empty({(int64_t)plan.heur.workspaceSize}, opts_u8);
-    ws_ptr = workspace.data_ptr();
-  }
+  void* ws_ptr = plan.workspace.defined() ? plan.workspace.data_ptr() : nullptr;
   float alpha = 1.0f, beta = 0.0f;
-  void* pA = a_stored.data_ptr();
+  void* pA = plan.a_stored.data_ptr();
   void* pB = b_stored_.data_ptr();
-  void* pC = dC.data_ptr();
-  CHECK_CUDA(cudaStreamSynchronize(stream));
+  void* pC = plan.dC.data_ptr();
   CHECK_CUBLASLT(cublasLtMatmul(
       lt_, plan.opDesc, &alpha, pA, plan.Adesc, pB, Bdesc_, &beta, pC,
       plan.Ddesc, pC, plan.Ddesc, &plan.heur.algo, ws_ptr,
-      plan.heur.workspaceSize, 0));
+      plan.heur.workspaceSize, stream));
 
   at::Tensor out = at::empty({M_pad, OC_}, x.options());
   total = (size_t)M_pad * OC_;
   if (out_f32_) {
     output_kernel_f<<<cdiv(total, threads), threads, 0, stream>>>(
-        dC.data_ptr<float>(), M_pad, OC_,
+        plan.dC.data_ptr<float>(), M_pad, OC_,
         bias_.has_value() ? bias_->data_ptr<float>() : nullptr,
         bias_.has_value() ? 1 : 0, out.data_ptr<float>());
   } else {
     output_kernel_h<<<cdiv(total, threads), threads, 0, stream>>>(
-        dC.data_ptr<float>(), M_pad, OC_,
+        plan.dC.data_ptr<float>(), M_pad, OC_,
         bias_.has_value() ? reinterpret_cast<const __half*>(bias_->data_ptr<at::Half>())
                           : nullptr,
         bias_.has_value() ? 1 : 0,
