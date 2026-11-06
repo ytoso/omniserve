@@ -11,4 +11,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("forward", &NVFP4GEMM::forward);
   m.def("gemm_act_forward", &gemm_act_forward_cuda,
         "NVFP4 W4A4 GEMM for two dynamic activations: C = x @ y^T");
+  m.def("kv_quantize", &kv_quantize_cuda,
+        "Quantize a [L, H, D] KV tensor to NVFP4 (packed E2M1 + UE4M3 scales)");
+  m.def("decode_attention", &decode_attention_cuda,
+        "Fused NVFP4 decode attention over an FP4 KV cache");
 }

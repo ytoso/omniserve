@@ -50,3 +50,19 @@ class NVFP4GEMM {
 };
 
 at::Tensor gemm_act_forward_cuda(at::Tensor x, at::Tensor y);
+
+// Fused NVFP4 decode attention.
+//
+// KV cache is stored in NVFP4 (packed E2M1 + per-16 UE4M3 scales), so the
+// memory-bound decode path reads 4 bits/element instead of 16. The whole
+// attention (QK^T scoring, masked softmax, PV accumulation) runs in a single
+// fused kernel launch per layer instead of 2*H GEMM launches.
+std::tuple<at::Tensor, at::Tensor> kv_quantize_cuda(at::Tensor x);
+
+at::Tensor decode_attention_cuda(
+    at::Tensor q,        // [H, D] fp16
+    at::Tensor k_packed, // [Lk, KH, D/2] uint8
+    at::Tensor k_scales, // [Lk, KH, D/16] uint8
+    at::Tensor v_packed, // [Lk, KH, D/2] uint8
+    at::Tensor v_scales, // [Lk, KH, D/16] uint8
+    double scale);

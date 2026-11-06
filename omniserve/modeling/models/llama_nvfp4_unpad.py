@@ -22,6 +22,18 @@ from omniserve.modeling.layers.layernorm import RMSNorm
 from omniserve.modeling.layers.nvfp4_attention import NVFP4Attention
 
 
+def _dequant_kv(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Dequantize an NVFP4 KV cache tile back to fp16 [L, H, D]."""
+    import omniserve_backend.qgemm_nvfp4 as B  # noqa: F401  (ensure backend loaded)
+    from omniserve.utils.nvfp4 import dequantize_nvfp4_abs
+
+    L, H, D2 = packed.shape
+    D = D2 * 2
+    q = packed.reshape(L * H, D2)
+    s = scales.reshape(L * H, D // 16)
+    return dequantize_nvfp4_abs(q, s).reshape(L, H, D).half()
+
+
 class LlamaAttention(nn.Module):
     def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False):
         super().__init__()
@@ -46,11 +58,14 @@ class LlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        kv_cache=None,
+    ):
         q = self._reshape(self.q_proj(hidden_states), self.num_heads)
         k = self._reshape(self.k_proj(hidden_states), self.num_kv_heads)
         v = self._reshape(self.v_proj(hidden_states), self.num_kv_heads)
+
+        if self.use_nvfp4_attn:
+            return self._nvfp4_attn(q, k, v, kv_cache)
 
         if kv_cache is not None:
             past_k, past_v = kv_cache
@@ -58,18 +73,61 @@ class LlamaAttention(nn.Module):
             v = torch.cat([past_v, v], dim=0)
         new_cache = (k, v)
 
-        # cuBLASLt FP4 GEMM needs K >= 64; for very short contexts (decode)
-        # fall back to the FP16 SDPA path.
-        if self.use_nvfp4_attn and k.size(0) >= 64:
-            causal_start = 0 if kv_cache is None else (k.size(0) - q.size(0))
-            attn = self.nvfp4_attn(q, k, v, causal_start=causal_start)
+        n_rep = self.num_heads // self.num_kv_heads
+        k_rep = k.repeat_interleave(n_rep, dim=1)
+        v_rep = v.repeat_interleave(n_rep, dim=1)
+        attn = F.scaled_dot_product_attention(
+            q.transpose(0, 1), k_rep.transpose(0, 1), v_rep.transpose(0, 1),
+            is_causal=True,
+        ).transpose(0, 1)
+
+        out = self.o_proj(attn.reshape(-1, self.q_size))
+        return out, new_cache
+
+    def _nvfp4_attn(self, q, k, v, kv_cache):
+        """FP4 KV cache + fused FP4 attention.
+
+        The KV cache is stored in NVFP4 (packed E2M1 + per-16 UE4M3 scales),
+        so decode reads 4 bits per element. A single token decode runs one
+        fused kernel (scores + softmax + PV) instead of 2*H GEMM launches.
+        """
+        import omniserve_backend.qgemm_nvfp4 as B
+
+        nkp, nks = B.kv_quantize(k)
+        nvp, nvs = B.kv_quantize(v)
+        if kv_cache is not None:
+            pkp, pks, pvp, pvs = kv_cache
+            nkp = torch.cat([pkp, nkp], dim=0)
+            nks = torch.cat([pks, nks], dim=0)
+            nvp = torch.cat([pvp, nvp], dim=0)
+            nvs = torch.cat([pvs, nvs], dim=0)
+        new_cache = (nkp, nks, nvp, nvs)
+
+        Lk = nkp.size(0)
+        Lq = q.size(0)
+
+        if Lq == 1:
+            # ---- fused single-token decode ----
+            attn = B.decode_attention(
+                q[0], nkp, nks, nvp, nvs, self.head_dim ** -0.5
+            ).unsqueeze(0)
+        elif kv_cache is None and Lk >= 64:
+            # ---- prefill: use the exact fp16 K/V, FP4 tensor-core GEMMs ----
+            attn = self.nvfp4_attn(q, k, v, causal_start=0)
+        elif Lk >= 64:
+            # ---- chunked prefill: dequant the FP4 cache, FP4 attention GEMMs ----
+            attn = self.nvfp4_attn(
+                q, _dequant_kv(nkp, nks), _dequant_kv(nvp, nvs),
+                causal_start=Lk - Lq,
+            )
         else:
-            # GQA: repeat KV heads to match query heads.
+            k_deq = _dequant_kv(nkp, nks)
+            v_deq = _dequant_kv(nvp, nvs)
             n_rep = self.num_heads // self.num_kv_heads
-            k_rep = k.repeat_interleave(n_rep, dim=1)
-            v_rep = v.repeat_interleave(n_rep, dim=1)
             attn = F.scaled_dot_product_attention(
-                q.transpose(0, 1), k_rep.transpose(0, 1), v_rep.transpose(0, 1),
+                q.transpose(0, 1),
+                k_deq.repeat_interleave(n_rep, dim=1).transpose(0, 1),
+                v_deq.repeat_interleave(n_rep, dim=1).transpose(0, 1),
                 is_causal=True,
             ).transpose(0, 1)
 
