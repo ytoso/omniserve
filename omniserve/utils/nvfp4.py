@@ -181,7 +181,12 @@ def dequantize_weight_nvfp4(qweight: torch.Tensor, scale_fp8: torch.Tensor,
 # ---------------------------------------------------------------------------
 
 
-def quantize_nvfp4_abs(w: torch.Tensor, block_size: int = 16):
+# Candidate divisors of the block max used by the MSE-optimal scale search.
+_SCALE_CANDIDATES = (6.0, 4.5, 3.0)
+
+
+def quantize_nvfp4_abs(w: torch.Tensor, block_size: int = 16,
+                       scale_search: bool = True):
     """Quantize a ``[..., K]`` float tensor to NVFP4 with absolute UE4M3 scales.
 
     Returns
@@ -190,6 +195,10 @@ def quantize_nvfp4_abs(w: torch.Tensor, block_size: int = 16):
     scale : uint8 ``[..., K // block_size]`` (UE4M3 per-block scales, sign bit 0)
 
     Dequantization is ``x = e2m1(q) * e4m3(scale)``.
+
+    With ``scale_search`` the per-block UE4M3 scale is chosen to minimise the
+    squared reconstruction error over a few divisors of the block max (E2M1's
+    single mantissa bit makes the classic ``max/6`` clipping suboptimal).
     """
     x = w.float()
     *lead, K = x.shape
@@ -197,14 +206,28 @@ def quantize_nvfp4_abs(w: torch.Tensor, block_size: int = 16):
         raise ValueError(f"last dim {K} not divisible by block_size {block_size}")
 
     xr = x.reshape(-1, K // block_size, block_size)
-    block_max = xr.abs().amax(dim=-1, keepdim=True)
-    S = block_max / 6.0
-    scale_fp8 = float_to_e4m3(S).reshape(*lead, K // block_size)
-    S_deq = e4m3_to_float(scale_fp8).reshape(-1, K // block_size, 1).clamp(
-        min=1e-12
-    )
-    fp4 = float_to_e2m1(xr / S_deq)
+    block_max = xr.abs().amax(dim=-1, keepdim=True).clamp(min=1e-9)
+    cands = _SCALE_CANDIDATES if scale_search else (6.0,)
+
+    best_err = None
+    best_bits = None
+    best_s = None
+    for c in cands:
+        bits = float_to_e4m3(block_max / c)
+        s = e4m3_to_float(bits).clamp(min=1e-12)
+        rec = e2m1_to_float(float_to_e2m1(xr / s)) * s
+        err = ((rec - xr) ** 2).sum(dim=-1, keepdim=True)
+        if best_err is None:
+            best_err, best_bits, best_s = err, bits, s
+        else:
+            m = err < best_err
+            best_err = torch.where(m, err, best_err)
+            best_bits = torch.where(m, bits, best_bits)
+            best_s = torch.where(m, s, best_s)
+
+    fp4 = float_to_e2m1(xr / best_s)
     q = pack_e2m1(fp4.reshape(*lead, K))
+    scale_fp8 = best_bits.reshape(*lead, K // block_size)
     return q, scale_fp8
 
 

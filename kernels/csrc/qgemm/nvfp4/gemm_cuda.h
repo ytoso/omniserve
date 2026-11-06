@@ -58,6 +58,7 @@ at::Tensor gemm_act_forward_cuda(at::Tensor x, at::Tensor y);
 // attention (QK^T scoring, masked softmax, PV accumulation) runs in a single
 // fused kernel launch per layer instead of 2*H GEMM launches.
 std::tuple<at::Tensor, at::Tensor> kv_quantize_cuda(at::Tensor x);
+std::tuple<at::Tensor, at::Tensor> kv_quantize_fp8_cuda(at::Tensor x);
 
 at::Tensor decode_attention_cuda(
     at::Tensor q,        // [H, D] fp16

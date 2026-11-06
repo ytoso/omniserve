@@ -98,6 +98,64 @@ __device__ __forceinline__ float e4m3_decode(unsigned b) {
   return sign ? -val : val;
 }
 
+__device__ __forceinline__ float pow2i(int k) {
+  return __int_as_float((k + 127) << 23);
+}
+
+// Branch-light E4M3 decode (exact, no powf).
+__device__ __forceinline__ float e4m3_decode_fast(unsigned b) {
+  int sign = (b >> 7) & 1;
+  int exp = (b >> 3) & 0xF;
+  int man = b & 7;
+  float val = (exp == 0) ? (float)man * pow2i(-9)
+                         : (float)(8 + man) * pow2i(exp - 10);
+  return sign ? -val : val;
+}
+
+// E2M1 (1s,2e,1m, bias 1) decoded arithmetically to avoid a local array.
+__device__ __forceinline__ float e2m1_decode(unsigned v) {
+  unsigned mag = v & 7u;
+  unsigned exp = (mag >> 1) & 3u;
+  unsigned man = mag & 1u;
+  float val = (exp == 0) ? ((float)man * 0.5f)
+                         : ((float)(2u + man) * pow2i((int)exp - 2));
+  return (v & 8u) ? -val : val;
+}
+
+// value of FP4 element `d` given packed bytes and per-16 scales of that row.
+// Empirical MSE-optimal E2M1 block scale.
+// E2M1 has a single mantissa bit, so the largest magnitudes in a block are
+// poorly served by scale = max/6. Searching a few divisors of the block max
+// and keeping the one with the smallest squared error is free (3x ALU) and
+// typically recovers several percent of relative error.
+__device__ __forceinline__ unsigned best_e4m3_scale(const float* x, int n,
+                                                    float* out_scale) {
+  const float cands[3] = {6.0f, 4.5f, 3.0f};
+  float best_err = INFINITY;
+  unsigned best_bits = 0x01u;
+  float best_s = 0.0f;
+  #pragma unroll
+  for (int c = 0; c < 3; c++) {
+    float mx = 0.0f;
+    for (int i = 0; i < n; i++) mx = fmaxf(mx, fabsf(x[i]));
+    unsigned bits = (mx == 0.0f) ? 0x01u : e4m3_encode(mx / cands[c]);
+    float s = e4m3_decode_fast(bits);
+    if (s < 1e-12f) s = 1e-12f;
+    float err = 0.0f;
+    for (int i = 0; i < n; i++) {
+      float d = e2m1_decode(e2m1_encode(x[i] / s)) * s - x[i];
+      err += d * d;
+    }
+    if (err < best_err) {
+      best_err = err;
+      best_bits = bits;
+      best_s = s;
+    }
+  }
+  *out_scale = best_s;
+  return best_bits;
+}
+
 // ---------------------------------------------------------------------------
 // Kernels
 // ---------------------------------------------------------------------------
@@ -119,13 +177,10 @@ __global__ void quantize_act_fused(const T* __restrict__ x, int M, int K,
   const T* row = x + (size_t)j * K;
   int start = b * block_size;
 
-  float mx = 0.0f;
-  for (int e = 0; e < block_size; e++) {
-    float v = to_float(row[start + e]);
-    mx = fmaxf(mx, fabsf(v));
-  }
-  unsigned s = (mx == 0.0f) ? 0x01u : e4m3_encode(mx / 6.0f);
-  float S = e4m3_decode(s);
+  float vals[16];
+  for (int e = 0; e < block_size; e++) vals[e] = to_float(row[start + e]);
+  float S = 0.0f;
+  unsigned s = best_e4m3_scale(vals, block_size, &S);
   if (S < 1e-12f) S = 1e-12f;
 
   // Tiled VEC16_UE4M3 scale layout.
@@ -140,8 +195,8 @@ __global__ void quantize_act_fused(const T* __restrict__ x, int M, int K,
   int K2 = K / 2;
   unsigned char* dst = a_stored + (size_t)j * K2 + start / 2;
   for (int e = 0; e < block_size; e += 2) {
-    unsigned lo = e2m1_encode(to_float(row[start + e]) / S);
-    unsigned hi = e2m1_encode(to_float(row[start + e + 1]) / S);
+    unsigned lo = e2m1_encode(vals[e] / S);
+    unsigned hi = e2m1_encode(vals[e + 1] / S);
     dst[e / 2] = (unsigned char)(lo | (hi << 4));
   }
 }
@@ -559,31 +614,6 @@ at::Tensor gemm_act_forward_cuda(at::Tensor x, at::Tensor y) {
 // masked softmax, PV) is fused into one kernel launch per layer.
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ float pow2i(int k) {
-  return __int_as_float((k + 127) << 23);
-}
-
-// Branch-light E4M3 decode (exact, no powf).
-__device__ __forceinline__ float e4m3_decode_fast(unsigned b) {
-  int sign = (b >> 7) & 1;
-  int exp = (b >> 3) & 0xF;
-  int man = b & 7;
-  float val = (exp == 0) ? (float)man * pow2i(-9)
-                         : (float)(8 + man) * pow2i(exp - 10);
-  return sign ? -val : val;
-}
-
-// E2M1 (1s,2e,1m, bias 1) decoded arithmetically to avoid a local array.
-__device__ __forceinline__ float e2m1_decode(unsigned v) {
-  unsigned mag = v & 7u;
-  unsigned exp = (mag >> 1) & 3u;
-  unsigned man = mag & 1u;
-  float val = (exp == 0) ? ((float)man * 0.5f)
-                         : ((float)(2u + man) * pow2i((int)exp - 2));
-  return (v & 8u) ? -val : val;
-}
-
-// value of FP4 element `d` given packed bytes and per-16 scales of that row.
 __device__ __forceinline__ float deq_fp4(const unsigned char* __restrict__ p,
                                         const unsigned char* __restrict__ s,
                                         int d) {
@@ -591,6 +621,37 @@ __device__ __forceinline__ float deq_fp4(const unsigned char* __restrict__ p,
   unsigned nib = (d & 1) ? (byte >> 4) : (byte & 0xFu);
   return e2m1_decode(nib) * e4m3_decode_fast(s[d >> 4]);
 }
+
+// ----------------------------------------------------------------------
+// KV-cache element fetch, templated on the storage format.
+//   FP4: 2 E2M1 per byte, one UE4M3 scale per 16 elements.
+//   FP8: 1 E4M3 per byte, one fp32 scale per (token, kv-head) row.
+// ----------------------------------------------------------------------
+template <bool FP8>
+struct KVFetch;
+
+template <>
+struct KVFetch<false> {
+  __device__ __forceinline__ static float at(const unsigned char* __restrict__ row,
+                                             const void* __restrict__ scales,
+                                             int d) {
+    unsigned byte = row[d >> 1];
+    unsigned nib = (d & 1) ? (byte >> 4) : (byte & 0xFu);
+    const unsigned char* sc = static_cast<const unsigned char*>(scales);
+    return e2m1_decode(nib) * e4m3_decode_fast(sc[d >> 4]);
+  }
+};
+
+template <>
+struct KVFetch<true> {
+  __device__ __forceinline__ static float at(const unsigned char* __restrict__ row,
+                                             const void* __restrict__ scales,
+                                             int d) {
+    const float* sc = static_cast<const float*>(scales);
+    return e4m3_decode_fast(row[d]) * sc[0];
+  }
+};
+
 
 // Quantize one [outer, inner] half/float matrix into (packed, scales).
 __global__ void kv_quantize_kernel(const float* __restrict__ x, int outer,
@@ -605,17 +666,17 @@ __global__ void kv_quantize_kernel(const float* __restrict__ x, int outer,
   const float* row = x + (size_t)o * inner;
   int start = b * 16;
 
-  float mx = 0.0f;
-  for (int e = 0; e < 16; e++) mx = fmaxf(mx, fabsf(row[start + e]));
-  unsigned s = (mx == 0.0f) ? 0x01u : e4m3_encode(mx / 6.0f);
-  float S = e4m3_decode(s);
+  float vals[16];
+  for (int e = 0; e < 16; e++) vals[e] = row[start + e];
+  float S = 0.0f;
+  unsigned s = best_e4m3_scale(vals, 16, &S);
   if (S < 1e-12f) S = 1e-12f;
   scales[(size_t)o * nblocks + b] = (unsigned char)s;
 
   unsigned char* dst = packed + (size_t)o * (inner / 2) + start / 2;
   for (int e = 0; e < 16; e += 2) {
-    unsigned lo = e2m1_encode(row[start + e] / S);
-    unsigned hi = e2m1_encode(row[start + e + 1] / S);
+    unsigned lo = e2m1_encode(vals[e] / S);
+    unsigned hi = e2m1_encode(vals[e + 1] / S);
     dst[e / 2] = (unsigned char)(lo | (hi << 4));
   }
 }
@@ -632,19 +693,101 @@ __global__ void kv_quantize_kernel_h(const __half* __restrict__ x, int outer,
   const __half* row = x + (size_t)o * inner;
   int start = b * 16;
 
-  float mx = 0.0f;
-  for (int e = 0; e < 16; e++) mx = fmaxf(mx, fabsf(__half2float(row[start + e])));
-  unsigned s = (mx == 0.0f) ? 0x01u : e4m3_encode(mx / 6.0f);
-  float S = e4m3_decode(s);
+  float vals[16];
+  for (int e = 0; e < 16; e++) vals[e] = __half2float(row[start + e]);
+  float S = 0.0f;
+  unsigned s = best_e4m3_scale(vals, 16, &S);
   if (S < 1e-12f) S = 1e-12f;
   scales[(size_t)o * nblocks + b] = (unsigned char)s;
 
   unsigned char* dst = packed + (size_t)o * (inner / 2) + start / 2;
   for (int e = 0; e < 16; e += 2) {
-    unsigned lo = e2m1_encode(__half2float(row[start + e]) / S);
-    unsigned hi = e2m1_encode(__half2float(row[start + e + 1]) / S);
+    unsigned lo = e2m1_encode(vals[e] / S);
+    unsigned hi = e2m1_encode(vals[e + 1] / S);
     dst[e / 2] = (unsigned char)(lo | (hi << 4));
   }
+}
+
+// Quantize [L, H, D] to E4M3 with one fp32 scale per (token, head) row.
+__global__ void kv_quantize_fp8_kernel(const float* __restrict__ x, int rows,
+                                       int D, float* __restrict__ scales,
+                                       unsigned char* __restrict__ packed) {
+  int r = blockIdx.x;
+  if (r >= rows) return;
+  extern __shared__ float sh[];
+  const float* row = x + (size_t)r * D;
+  float mx = 0.0f;
+  for (int d = threadIdx.x; d < D; d += blockDim.x)
+    mx = fmaxf(mx, fabsf(row[d]));
+  for (int off = 16; off > 0; off >>= 1)
+    mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, off));
+  __syncthreads();
+  sh[threadIdx.x >> 5] = mx;   // only meaningful for the first warp
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float m = sh[0];
+    for (int w = 1; w < (int)(blockDim.x >> 5); w++) m = fmaxf(m, sh[w]);
+    float s = (m == 0.0f) ? 1.0f : (m / 240.0f);
+    scales[r] = s;
+    sh[0] = s;
+  }
+  __syncthreads();
+  float s = sh[0];
+  for (int d = threadIdx.x; d < D; d += blockDim.x)
+    packed[(size_t)r * D + d] = (unsigned char)e4m3_encode(row[d] / s);
+}
+
+__global__ void kv_quantize_fp8_kernel_h(const __half* __restrict__ x, int rows,
+                                         int D, float* __restrict__ scales,
+                                         unsigned char* __restrict__ packed) {
+  int r = blockIdx.x;
+  if (r >= rows) return;
+  extern __shared__ float sh[];
+  const __half* row = x + (size_t)r * D;
+  float mx = 0.0f;
+  for (int d = threadIdx.x; d < D; d += blockDim.x)
+    mx = fmaxf(mx, fabsf(__half2float(row[d])));
+  for (int off = 16; off > 0; off >>= 1)
+    mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, off));
+  __syncthreads();
+  sh[threadIdx.x >> 5] = mx;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float m = sh[0];
+    for (int w = 1; w < (int)(blockDim.x >> 5); w++) m = fmaxf(m, sh[w]);
+    float s = (m == 0.0f) ? 1.0f : (m / 240.0f);
+    scales[r] = s;
+    sh[0] = s;
+  }
+  __syncthreads();
+  float s = sh[0];
+  for (int d = threadIdx.x; d < D; d += blockDim.x)
+    packed[(size_t)r * D + d] = (unsigned char)e4m3_encode(__half2float(row[d]) / s);
+}
+
+std::tuple<at::Tensor, at::Tensor> kv_quantize_fp8_cuda(at::Tensor x) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 3, "x must be a [L, H, D] CUDA tensor");
+  int L = x.size(0), H = x.size(1), D = x.size(2);
+  c10::cuda::CUDAGuard guard(x.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  at::Tensor xc = x.contiguous();
+  auto opts_u8 = xc.options().dtype(at::kByte);
+  at::Tensor packed = at::empty({L, H, D}, opts_u8);
+  at::Tensor scales = at::empty({L, H}, xc.options().dtype(at::kFloat));
+  int threads = 128;
+  int smem = 32 * sizeof(float);
+  if (xc.scalar_type() == at::kHalf) {
+    kv_quantize_fp8_kernel_h<<<L * H, threads, smem, stream>>>(
+        reinterpret_cast<const __half*>(xc.data_ptr<at::Half>()), L * H, D,
+        scales.data_ptr<float>(), packed.data_ptr<unsigned char>());
+  } else {
+    at::Tensor xf = xc.to(at::kFloat);
+    kv_quantize_fp8_kernel<<<L * H, threads, smem, stream>>>(
+        xf.data_ptr<float>(), L * H, D, scales.data_ptr<float>(),
+        packed.data_ptr<unsigned char>());
+  }
+  CHECK_CUDA(cudaGetLastError());
+  return std::make_tuple(packed, scales);
 }
 
 std::tuple<at::Tensor, at::Tensor> kv_quantize_cuda(at::Tensor x) {
@@ -688,11 +831,11 @@ constexpr int kMaxDecodeChunk = 64;  // key-range splits (runtime chosen)
 // Each warp scores 2 keys at once: the lanes are split into `ndw`-wide groups
 // (ndw = D/8 dwords), each group handling one key and consuming 8 FP4 values
 // per uint32 load. Q is staged in shared memory.
+template <bool FP8>
 __global__ void decode_scores_kernel(
     const __half* __restrict__ q, int H, int KH, int Lk, int D,
-    const unsigned char* __restrict__ kp,
-    const unsigned char* __restrict__ ks, float scale, int nchunks,
-    float* __restrict__ prob) {
+    const unsigned char* __restrict__ kp, const void* __restrict__ ks,
+    float scale, int nchunks, float* __restrict__ prob) {
   extern __shared__ float shm[];
   __half* qsh = reinterpret_cast<__half*>(shm);   // [D] staged query
   const int h = blockIdx.x;
@@ -705,8 +848,7 @@ __global__ void decode_scores_kernel(
   for (int d = threadIdx.x; d < D; d += blockDim.x) qsh[d] = q[(size_t)h * D + d];
   __syncthreads();
 
-  const size_t kstride = (size_t)KH * (D / 2);
-  const size_t sstride = (size_t)KH * (D / 16);
+  const size_t kstride = FP8 ? (size_t)KH * D : (size_t)KH * (D / 2);
   const int ndw = D / 8;
   const int groups = 32 / ndw;               // keys per warp
   const int jh = lane / ndw;                 // which key this lane serves
@@ -723,15 +865,15 @@ __global__ void decode_scores_kernel(
     int j = base + jh;
     float acc = 0.0f;
     if (j < j1) {
-      const unsigned char* kb = kp + (size_t)j * kstride + (size_t)kh * (D / 2);
-      const unsigned char* sb = ks + (size_t)j * sstride + (size_t)kh * (D / 16);
-      unsigned w = reinterpret_cast<const unsigned*>(kb)[dw];
-      float sc = e4m3_decode_fast(sb[dw / 2]);
-      float part = 0.0f;
+      const unsigned char* kb =
+          kp + (size_t)j * kstride + (size_t)kh * (FP8 ? D : (D / 2));
+      const void* sb = FP8
+          ? (const void*)(static_cast<const float*>(ks) + (size_t)j * KH + kh)
+          : (const void*)(static_cast<const unsigned char*>(ks) +
+                          (size_t)j * (size_t)KH * (D / 16) + (size_t)kh * (D / 16));
       #pragma unroll
       for (int k = 0; k < 8; k++)
-        part += __half2float(qsh[dw * 8 + k]) * e2m1_decode((w >> (4 * k)) & 0xFu);
-      acc = part * sc;
+        acc += __half2float(qsh[dw * 8 + k]) * KVFetch<FP8>::at(kb, sb, dw * 8 + k);
     }
     for (int off = ndw / 2; off > 0; off >>= 1)
       acc += __shfl_down_sync(gmask, acc, off);
@@ -789,11 +931,11 @@ __global__ void decode_softmax_kernel(float* __restrict__ prob, int H, int Lk) {
 }
 
 // Stage 2: partial PV over a key chunk. 128 threads = 16 dwords x 8 j-streams.
+template <bool FP8>
 __global__ void decode_pv_kernel(
     const float* __restrict__ prob, int H, int KH, int Lk, int D,
-    const unsigned char* __restrict__ vp,
-    const unsigned char* __restrict__ vs, int nchunks,
-    float* __restrict__ part) {
+    const unsigned char* __restrict__ vp, const void* __restrict__ vs,
+    int nchunks, float* __restrict__ part) {
   const int h = blockIdx.x;
   const int chunk = blockIdx.y;
   const int kh = h / (H / KH);
@@ -807,20 +949,22 @@ __global__ void decode_pv_kernel(
   int j0 = chunk * per;
   int j1 = min(j0 + per, Lk);
   const float* prow = prob + (size_t)h * Lk;
-  const size_t vstride = (size_t)KH * (D / 2);
-  const size_t sstride = (size_t)KH * (D / 16);
+  const size_t vstride = FP8 ? (size_t)KH * D : (size_t)KH * (D / 2);
+  const size_t sstride = FP8 ? (size_t)KH : (size_t)KH * (D / 16);
 
   float acc[8];
   #pragma unroll
   for (int k = 0; k < 8; k++) acc[k] = 0.0f;
 
   for (int j = j0 + js; j < j1; j += nstreams) {
-    const unsigned char* vb = vp + (size_t)j * vstride + (size_t)kh * (D / 2);
-    unsigned w = reinterpret_cast<const unsigned*>(vb)[dw];
-    float sc = e4m3_decode_fast(vs[(size_t)j * sstride + (size_t)kh * (D / 16) + dw / 2]);
-    float p = prow[j] * sc;
+    const unsigned char* vb = vp + (size_t)j * vstride + (size_t)kh * (FP8 ? D : (D / 2));
+    const void* sb = FP8
+        ? (const void*)(static_cast<const float*>(vs) + (size_t)j * KH + kh)
+        : (const void*)(static_cast<const unsigned char*>(vs) +
+                        (size_t)j * sstride + (size_t)kh * (D / 16));
+    float p = prow[j];
     #pragma unroll
-    for (int k = 0; k < 8; k++) acc[k] += p * e2m1_decode((w >> (4 * k)) & 0xFu);
+    for (int k = 0; k < 8; k++) acc[k] += p * KVFetch<FP8>::at(vb, sb, dw * 8 + k);
   }
 
   // combine the j-streams of this dword through shared memory
@@ -857,10 +1001,14 @@ at::Tensor decode_attention_cuda(at::Tensor q, at::Tensor k_packed,
   TORCH_CHECK(q.is_cuda() && k_packed.is_cuda(), "tensors must be CUDA");
   int H = q.size(0), D = q.size(1);
   int Lk = k_packed.size(0), KH = k_packed.size(1);
-  TORCH_CHECK(k_packed.size(2) * 2 == D, "head_dim mismatch");
+  const bool fp8_shape = k_scales.scalar_type() == at::kFloat;
+  TORCH_CHECK(fp8_shape ? (k_packed.size(2) == D)
+                        : (k_packed.size(2) * 2 == D),
+              "head_dim mismatch");
   TORCH_CHECK(H % KH == 0, "H must be a multiple of KH");
   TORCH_CHECK(D % 8 == 0, "head_dim must be a multiple of 8");
   TORCH_CHECK(Lk > 0, "empty KV cache");
+  const bool fp8 = fp8_shape;
 
   c10::cuda::CUDAGuard guard(q.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -875,10 +1023,19 @@ at::Tensor decode_attention_cuda(at::Tensor q, at::Tensor k_packed,
   at::Tensor part = at::empty({H, nchunks, D}, q.options().dtype(at::kFloat));
 
   dim3 score_grid(H, nchunks);
-  decode_scores_kernel<<<score_grid, 128, (size_t)D * sizeof(__half), stream>>>(
-      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()), H, KH, Lk, D,
-      k_packed.data_ptr<unsigned char>(), k_scales.data_ptr<unsigned char>(),
-      (float)scale, nchunks, prob.data_ptr<float>());
+  const void* ksc = k_scales.data_ptr();
+  const void* vsc = v_scales.data_ptr();
+  if (fp8) {
+    decode_scores_kernel<true><<<score_grid, 128, (size_t)D * sizeof(__half), stream>>>(
+        reinterpret_cast<const __half*>(q.data_ptr<at::Half>()), H, KH, Lk, D,
+        k_packed.data_ptr<unsigned char>(), ksc, (float)scale, nchunks,
+        prob.data_ptr<float>());
+  } else {
+    decode_scores_kernel<false><<<score_grid, 128, (size_t)D * sizeof(__half), stream>>>(
+        reinterpret_cast<const __half*>(q.data_ptr<at::Half>()), H, KH, Lk, D,
+        k_packed.data_ptr<unsigned char>(), ksc, (float)scale, nchunks,
+        prob.data_ptr<float>());
+  }
   CHECK_CUDA(cudaGetLastError());
 
   decode_softmax_kernel<<<H, 256, 32 * sizeof(float), stream>>>(
@@ -888,10 +1045,15 @@ at::Tensor decode_attention_cuda(at::Tensor q, at::Tensor k_packed,
   int pv_threads = 128;
   int pv_smem = (pv_threads / (D / 8)) * D * sizeof(float);
   dim3 pv_grid(H, nchunks);
-  decode_pv_kernel<<<pv_grid, pv_threads, pv_smem, stream>>>(
-      prob.data_ptr<float>(), H, KH, Lk, D,
-      v_packed.data_ptr<unsigned char>(), v_scales.data_ptr<unsigned char>(),
-      nchunks, part.data_ptr<float>());
+  if (fp8) {
+    decode_pv_kernel<true><<<pv_grid, pv_threads, pv_smem, stream>>>(
+        prob.data_ptr<float>(), H, KH, Lk, D,
+        v_packed.data_ptr<unsigned char>(), vsc, nchunks, part.data_ptr<float>());
+  } else {
+    decode_pv_kernel<false><<<pv_grid, pv_threads, pv_smem, stream>>>(
+        prob.data_ptr<float>(), H, KH, Lk, D,
+        v_packed.data_ptr<unsigned char>(), vsc, nchunks, part.data_ptr<float>());
+  }
   CHECK_CUDA(cudaGetLastError());
 
   decode_combine_kernel<<<H, 128, 0, stream>>>(

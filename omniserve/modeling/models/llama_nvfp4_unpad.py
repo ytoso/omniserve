@@ -25,35 +25,49 @@ from omniserve.modeling.layers.nvfp4_attention import NVFP4Attention
 _KV_CAPACITY = 4096
 
 
-def _alloc_kv(cap: int, like: torch.Tensor):
-    """Allocate flat NVFP4 KV buffers with capacity for `cap` tokens."""
-    L, H, D2 = like.shape
-    D = D2 * 2
+def _alloc_kv(cap: int, like: torch.Tensor, kv_dtype: str = "fp4"):
+    """Allocate flat KV cache buffers matching the packed `like` tensor."""
+    L, H, W = like.shape
     dev, dt = like.device, like.dtype
+    if kv_dtype == "fp8":
+        # packed is [L, H, D] E4M3, one fp32 scale per (token, head)
+        return (
+            torch.zeros(cap, H, W, dtype=dt, device=dev),
+            torch.zeros(cap, H, dtype=torch.float32, device=dev),
+            torch.zeros(cap, H, W, dtype=dt, device=dev),
+            torch.zeros(cap, H, dtype=torch.float32, device=dev),
+        )
+    D = W * 2
     return (
-        torch.zeros(cap, H, D2, dtype=dt, device=dev),
+        torch.zeros(cap, H, W, dtype=dt, device=dev),
         torch.zeros(cap, H, D // 16, dtype=dt, device=dev),
-        torch.zeros(cap, H, D2, dtype=dt, device=dev),
+        torch.zeros(cap, H, W, dtype=dt, device=dev),
         torch.zeros(cap, H, D // 16, dtype=dt, device=dev),
     )
 
 
 def _dequant_kv(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Dequantize an NVFP4 KV cache tile back to fp16 [L, H, D]."""
-    import omniserve_backend.qgemm_nvfp4 as B  # noqa: F401  (ensure backend loaded)
-    from omniserve.utils.nvfp4 import dequantize_nvfp4_abs
+    """Dequantize a KV cache tile back to fp16 [L, H, D]."""
+    from omniserve.utils.nvfp4 import dequantize_nvfp4_abs, e4m3_to_float
 
-    L, H, D2 = packed.shape
-    D = D2 * 2
-    q = packed.reshape(L * H, D2)
+    L, H, Dp = packed.shape
+    if scales.dtype == torch.float32:
+        # E4M3 with one fp32 scale per (token, head)
+        D = Dp
+        vals = e4m3_to_float(packed.reshape(L * H, D))
+        return (vals * scales.reshape(L * H, 1)).reshape(L, H, D).half()
+    D = Dp * 2
+    q = packed.reshape(L * H, Dp)
     s = scales.reshape(L * H, D // 16)
     return dequantize_nvfp4_abs(q, s).reshape(L, H, D).half()
 
 
 class LlamaAttention(nn.Module):
-    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False):
+    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False,
+                 kv_dtype: str = "fp8"):
         super().__init__()
         self.use_nvfp4_attn = use_nvfp4_attn
+        self.kv_dtype = kv_dtype
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -110,20 +124,21 @@ class LlamaAttention(nn.Module):
         """
         import omniserve_backend.qgemm_nvfp4 as B
 
-        nkp, nks = B.kv_quantize(k)
-        nvp, nvs = B.kv_quantize(v)
+        quant = B.kv_quantize_fp8 if self.kv_dtype == "fp8" else B.kv_quantize
+        nkp, nks = quant(k)
+        nvp, nvs = quant(v)
         Lq = q.size(0)
 
         if kv_cache is None:
             prev = 0
             cap = max(_KV_CAPACITY, Lq)
-            nkp_buf, nks_buf, nvp_buf, nvs_buf = _alloc_kv(cap, nkp)
+            nkp_buf, nks_buf, nvp_buf, nvs_buf = _alloc_kv(cap, nkp, self.kv_dtype)
         else:
             nkp_buf, nks_buf, nvp_buf, nvs_buf, prev = kv_cache
             cap = nkp_buf.size(0)
             if prev + Lq > cap:
                 cap = max(cap * 2, prev + Lq)
-                grown = _alloc_kv(cap, nkp)
+                grown = _alloc_kv(cap, nkp, self.kv_dtype)
                 grown[0][:prev].copy_(nkp_buf[:prev])
                 grown[1][:prev].copy_(nks_buf[:prev])
                 grown[2][:prev].copy_(nvp_buf[:prev])
@@ -184,9 +199,11 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False):
+    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False,
+                 kv_dtype: str = "fp8"):
         super().__init__()
-        self.self_attn = LlamaAttention(config, use_nvfp4_attn=use_nvfp4_attn)
+        self.self_attn = LlamaAttention(config, use_nvfp4_attn=use_nvfp4_attn,
+                                        kv_dtype=kv_dtype)
         self.mlp = LlamaMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -204,12 +221,14 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaModel(nn.Module):
-    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False):
+    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False,
+                 kv_dtype: str = "fp8"):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, use_nvfp4_attn=use_nvfp4_attn)
+            [LlamaDecoderLayer(config, use_nvfp4_attn=use_nvfp4_attn,
+                               kv_dtype=kv_dtype)
              for _ in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -226,10 +245,12 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLM(nn.Module):
-    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False):
+    def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False,
+                 kv_dtype: str = "fp8"):
         super().__init__()
         self.config = config
-        self.model = LlamaModel(config, use_nvfp4_attn=use_nvfp4_attn)
+        self.model = LlamaModel(config, use_nvfp4_attn=use_nvfp4_attn,
+                                kv_dtype=kv_dtype)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(self, input_ids: torch.Tensor, kv_caches=None):

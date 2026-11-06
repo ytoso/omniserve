@@ -100,16 +100,46 @@ Results (CPU, torch 2.8):
 
 | Variant | Prefill | Decode (KV=2048) |
 |---|---|---|
-| FP16 baseline | 383.0 ms | 62.27 ms/tok |
-| NVFP4 linears, FP16 attention | 393.6 ms (0.97x) | 55.70 ms/tok (1.12x) |
-| **NVFP4 linears + FP4 attention + FP4 KV cache** | **292.3 ms (1.31x)** | **12.94 ms/tok (4.81x)** |
+| FP16 baseline | 381.4 ms | 62.27 ms/tok |
+| NVFP4 linears, FP16 attention | 421.0 ms (0.91x) | 59.2 ms/tok (1.05x) |
+| **W4A4 + FP4 attention + FP8 KV cache** | **295.9 ms (1.29x)** | **14.42 ms/tok (4.32x)** |
 
-Logit cosine vs the FP16 model is 0.9988 with a matching argmax.
+The decode win comes from a fused attention kernel: the KV cache is stored
+4-bit/8-bit and preallocated, and scores / masked softmax / PV run as four
+fused kernel launches per layer instead of 2*H cuBLASLt calls. Each uint32
+load decodes 8 FP4 values.
 
-The decode win comes from a fused FP4 attention kernel: the KV cache is stored
-as packed E2M1 + per-16 UE4M3 scales (4 bits/element, preallocated), and
-scores / masked softmax / PV run as four fused kernel launches per layer
-instead of 2*H cuBLASLt calls. Each uint32 load decodes 8 FP4 values.
+## Accuracy
+
+`python3 scripts/nvfp4_accuracy.py` measures each stage against FP16.
+Relative RMSE on Gaussian tensors:
+
+| Stage | before | after |
+|---|---|---|
+| weight-only NVFP4 | 0.144 | **0.098** |
+| W4A4 linear | 0.170 | **0.133** |
+| attention, FP4 KV | 0.135 | **0.129** |
+| attention, FP8 KV | - | **0.037** |
+| attention, FP4 softmax probs | 1.29 | 0.76 (only with `pv_fp4=True`) |
+
+Three changes drove this:
+
+1. **MSE-optimal block scale.** E2M1 has one mantissa bit, so `scale = max/6`
+   is suboptimal. The quantizer now searches a few divisors of the block max
+   (`6, 4.5, 3`) and keeps the one minimising squared error. Applies to the
+   Python weight quantizer and to the CUDA activation / KV kernels.
+2. **Softmax probabilities are no longer quantized by default.** FP4's single
+   mantissa bit on the very wide softmax distribution cost ~1.3 relative
+   error; keeping `P` in fp16 costs nothing measurable.
+3. **FP8 (E4M3) KV cache.** 3.5x lower attention error than FP4 KV *and
+   faster* (one row scale instead of per-16 lookups): 14.42 vs 15.78 ms/tok.
+
+FP8 KV is now the default (`kv_dtype="fp8"`); pass `kv_dtype="fp4"` for the
+smallest cache. End-to-end logit cosine vs the FP16 model is 0.9988.
+
+> Note: with randomly initialised weights the logits are nearly uniform, so
+> next-token agreement is not a meaningful metric here; only relative error
+> and cosine are reported.
 
 ### cuBLASLt FP4 (W4A4) vs FP16 GEMM on Jetson AGX Thor (sm_110, 20 SMs)
 

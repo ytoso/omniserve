@@ -15,8 +15,10 @@ points) with a **single-stage FP16 → NVFP4** path:
 
 | Part | Status |
 |---|---|
-| A — data-format layer (Python/torch) | ✅ W4A4 helpers + tests |
-| B — fused FP4 GEMM kernel (CUDA) | ✅ `qgemm_nvfp4` cuBLASLt kernel built + validated on Thor (sm_110); model wiring open |
+| A — data-format layer (Python/torch) | ✅ W4A4 helpers + MSE-optimal scale search |
+| B — fused FP4 GEMM kernel (CUDA) | ✅ `qgemm_nvfp4` cuBLASLt kernel |
+| C — NVFP4 attention + KV cache | ✅ fused decode kernels, FP4/FP8 KV |
+| D — end-to-end model + benchmark | ✅ `llama_nvfp4_unpad.py`, `scripts/nvfp4_bench.py`, `scripts/nvfp4_accuracy.py` |
 
 The existing INT4/INT8 kernels are **kept untouched** as a fallback; the NVFP4
 path is additive.

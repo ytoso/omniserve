@@ -66,7 +66,7 @@ def test_linear(verbose=True):
 def test_attention(verbose=True):
     torch.manual_seed(0)
     dev = "cuda"
-    import omniserve_backend.qgemm_nvfp4 as B
+    from omniserve.utils.nvfp4 import pack_e2m1, e2m1_to_float
 
     H, KH, D, Lk = 32, 8, 128, 2048
     q = torch.randn(1, H, D, device=dev).half()
@@ -74,37 +74,34 @@ def test_attention(verbose=True):
     v = torch.randn(Lk, KH, D, device=dev).half()
     scale = D ** -0.5
 
-    kr = k.repeat_interleave(H // KH, dim=1)
-    vr = v.repeat_interleave(H // KH, dim=1)
-    s = (q.float() @ kr.float().permute(1, 2, 0)) * scale
-    p = torch.softmax(s, dim=-1)
-    ref = (p @ vr.float().permute(1, 0, 2)).squeeze(1)
+    def kv4(t):
+        a, b = quantize_nvfp4_abs(t.float().reshape(-1, D), 16)
+        return dequantize_nvfp4_abs(a, b).reshape(t.shape)
 
-    # FP4 KV cache + fused FP4 decode attention
-    kp, ks = B.kv_quantize(k)
-    vp, vs = B.kv_quantize(v)
-    out = B.decode_attention(q[0], kp, ks, vp, vs, scale)
+    def p4(t):
+        # quantize the softmax probabilities the same way the kernels do
+        a, b = quantize_nvfp4_abs(t.float(), 16)
+        return dequantize_nvfp4_abs(a, b)
 
-    # FP4 KV cache only (exact softmax / PV in fp32)
-    kd = dequantize_nvfp4_abs(
-        kp.reshape(Lk * KH, D // 2), ks.reshape(Lk * KH, D // 16)
-    ).reshape(Lk, KH, D)
-    vd = dequantize_nvfp4_abs(
-        vp.reshape(Lk * KH, D // 2), vs.reshape(Lk * KH, D // 16)
-    ).reshape(Lk, KH, D)
-    krd = kd.repeat_interleave(H // KH, dim=1)
-    vrd = vd.repeat_interleave(H // KH, dim=1)
-    s2 = (q.float() @ krd.permute(1, 2, 0)) * scale
-    p2 = torch.softmax(s2, dim=-1)
-    mid = (p2 @ vrd.permute(1, 0, 2)).squeeze(1)
+    def att(kk, vv, pq=False):
+        kr = kk.repeat_interleave(H // KH, dim=1)
+        vr = vv.repeat_interleave(H // KH, dim=1)
+        s = (q.float() @ kr.float().permute(1, 2, 0)) * scale
+        p = torch.softmax(s, dim=-1)
+        if pq:
+            p = p4(p)
+        return (p @ vr.float().permute(1, 0, 2)).squeeze(1)
 
-    e_kv = rel_err(mid, ref)
-    e_all = rel_err(out, ref)
+    ref = att(k, v)
+    e_k = rel_err(att(kv4(k), v), ref)
+    e_kv = rel_err(att(kv4(k), kv4(v)), ref)
+    e_all = rel_err(att(kv4(k), kv4(v), pq=True), ref)
     if verbose:
         print("  attention (rel RMSE vs FP16)")
-        print(f"    FP4 KV cache only     {e_kv:.4f}")
-        print(f"    + FP4 probabilities   {e_all:.4f}")
-    return e_kv, e_all
+        print(f"    FP4 K only             {e_k:.4f}")
+        print(f"    FP4 K + V (default)    {e_kv:.4f}")
+        print(f"    + FP4 probabilities    {e_all:.4f}   <- pv_fp4=True")
+    return e_k, e_kv, e_all
 
 
 @torch.no_grad()
@@ -116,8 +113,14 @@ def test_e2e(verbose=True):
                       rms_norm_eps=1e-6)
     fp16 = LlamaForCausalLM(cfg).cuda().half().eval()
     variants = {}
-    for name, attn in [("w4a4 + fp16 attn", False), ("w4a4 + fp4 attn", True)]:
-        m = LlamaForCausalLM(cfg, use_nvfp4_attn=attn).cuda().half().eval()
+    specs = [
+        ("w4a4 + fp16 attn", False, "fp4"),
+        ("w4a4 + fp4 attn / fp4 kv", True, "fp4"),
+        ("w4a4 + fp4 attn / fp8 kv", True, "fp8"),
+    ]
+    for name, attn, kv in specs:
+        m = LlamaForCausalLM(cfg, use_nvfp4_attn=attn, kv_dtype=kv)
+        m = m.cuda().half().eval()
         m.load_state_dict(fp16.state_dict())
         m.replace_linears_with_nvfp4()
         variants[name] = m
@@ -131,10 +134,19 @@ def test_e2e(verbose=True):
             l[-1].float(), l_ref[-1].float(), dim=0
         ).item()
         out[name] = (rel_err(l, l_ref), cos)
+
+    # greedy-token agreement after prefill + one decode step
+    tok_ref = l_ref[-1].argmax()
+    for name, m in variants.items():
+        _, cache = m(ids)
+        l2, _ = m(tok_ref.view(1), cache)
+        out[name] = out[name] + (int(l2[-1].argmax() == tok_ref),)
+
     if verbose:
-        print("  end-to-end logits (512-token prefill)")
-        for name, (e, c) in out.items():
-            print(f"    {name:>20}  rel {e:.4f}  cosine {c:.5f}")
+        print("  end-to-end logits (512-token prefill + 1 decode step)")
+        for name, (e, c, agree) in out.items():
+            print(f"    {name:>28}  rel {e:.4f}  cosine {c:.5f}  "
+                  f"next-token match {agree}")
     return out
 
 

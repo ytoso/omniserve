@@ -14,10 +14,11 @@ from transformers import LlamaConfig
 from omniserve.modeling.models.llama_nvfp4_unpad import LlamaForCausalLM
 
 
-def build_models(config, device, use_nvfp4_attn=False):
+def build_models(config, device, use_nvfp4_attn=False, kv_dtype="fp8"):
     torch.manual_seed(0)
     fp16 = LlamaForCausalLM(config).to(device).half().eval()
-    nvfp4 = LlamaForCausalLM(config, use_nvfp4_attn=use_nvfp4_attn).to(device).half().eval()
+    nvfp4 = LlamaForCausalLM(config, use_nvfp4_attn=use_nvfp4_attn,
+                             kv_dtype=kv_dtype).to(device).half().eval()
     nvfp4.load_state_dict(fp16.state_dict())
     nvfp4.replace_linears_with_nvfp4()
     return fp16, nvfp4
@@ -55,6 +56,7 @@ def main():
     p.add_argument("--decode-steps", type=int, default=20)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--runs", type=int, default=5)
+    p.add_argument("--kv-dtype", type=str, default="fp8", choices=["fp4", "fp8"])
     args = p.parse_args()
 
     device = "cuda"
@@ -69,7 +71,8 @@ def main():
     )
     print("building models ...")
     fp16, nvfp4 = build_models(config, device)
-    _, nvfp4_attn = build_models(config, device, use_nvfp4_attn=True)
+    _, nvfp4_attn = build_models(config, device, use_nvfp4_attn=True,
+                                 kv_dtype=args.kv_dtype)
     n_params = sum(p.numel() for p in fp16.parameters()) / 1e9
     print(f"params: {n_params:.2f}B")
 
@@ -93,7 +96,8 @@ def main():
     print(f"\nprefill len={args.prefill_len}:")
     print(f"  fp16        {fp16_ms:.2f} ms")
     print(f"  nvfp4       {nvfp4_ms:.2f} ms  ({fp16_ms/nvfp4_ms:.2f}x)")
-    print(f"  nvfp4+attn  {nvfp4_attn_ms:.2f} ms  ({fp16_ms/nvfp4_attn_ms:.2f}x)")
+    print(f"  nvfp4+attn  {nvfp4_attn_ms:.2f} ms  ({fp16_ms/nvfp4_attn_ms:.2f}x)"
+          f"   [kv={args.kv_dtype}]")
 
     def bench_decode(model):
         for _ in range(args.warmup):
@@ -108,7 +112,8 @@ def main():
     print(f"decode (KV cache = {args.prefill_len} tokens):")
     print(f"  fp16        {fp16_lat:.2f} ms/tok")
     print(f"  nvfp4       {nvfp4_lat:.2f} ms/tok  ({fp16_lat/nvfp4_lat:.2f}x)")
-    print(f"  nvfp4+attn  {nvfp4_attn_lat:.2f} ms/tok  ({fp16_lat/nvfp4_attn_lat:.2f}x)")
+    print(f"  nvfp4+attn  {nvfp4_attn_lat:.2f} ms/tok  ({fp16_lat/nvfp4_attn_lat:.2f}x)"
+          f"   [kv={args.kv_dtype}]")
 
 
 if __name__ == "__main__":
