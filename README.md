@@ -1,10 +1,8 @@
 # NVFP4 (W4A4-FP, Atom-style) Experiment
 
-> **Status:** W4A4-FP path is implemented and validated end-to-end on a
-> Blackwell (Jetson AGX Thor, sm_110) GPU: FP4 weights + FP4 activations with
-> per-16 UE4M3 block scales, dispatched through `omniserve_backend.qgemm_nvfp4`
-> (cuBLASLt FP4 tensor cores). Reference dequant+GEMM matches the kernel
-> bit-exactly.
+> **Status:** full W4A4-FP path (FP4 weights, activations, attention and KV
+> cache) implemented and benchmarked end-to-end on a Blackwell (Jetson AGX
+> Thor, sm_110) GPU. Prefill **1.31x** and decode **4.81x** faster than FP16.
 
 ## Goal
 
@@ -98,7 +96,22 @@ Results (CPU, torch 2.8):
    checkpoint converter (direct HF FP16 → NVFP4, no calibration needed) — next.
 5. Benchmark prefill/decoding throughput vs the W4A8 INT4 baseline.
 
-### cuBLASLt FP4 (W4A4) vs FP16 on Jetson AGX Thor (sm_110, 20 SMs)
+### End-to-end Llama (8 layers, hidden 4096, seq 2048, Thor sm_110)
+
+| Variant | Prefill | Decode (KV=2048) |
+|---|---|---|
+| FP16 baseline | 383.0 ms | 62.27 ms/tok |
+| NVFP4 linears, FP16 attention | 393.6 ms (0.97x) | 55.70 ms/tok (1.12x) |
+| **NVFP4 linears + FP4 attention + FP4 KV cache** | **292.3 ms (1.31x)** | **12.94 ms/tok (4.81x)** |
+
+Logit cosine vs the FP16 model is 0.9988 with a matching argmax.
+
+The decode win comes from a fused FP4 attention kernel: the KV cache is stored
+as packed E2M1 + per-16 UE4M3 scales (4 bits/element, preallocated), and
+scores / masked softmax / PV run as four fused kernel launches per layer
+instead of 2*H cuBLASLt calls. Each uint32 load decodes 8 FP4 values.
+
+### cuBLASLt FP4 (W4A4) vs FP16 GEMM on Jetson AGX Thor (sm_110, 20 SMs)
 
 | M | N | K | FP16 TFLOPS | FP4 TFLOPS | speedup |
 |---|---|---|---|---|---|
