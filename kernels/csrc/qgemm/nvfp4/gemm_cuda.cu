@@ -676,119 +676,179 @@ std::tuple<at::Tensor, at::Tensor> kv_quantize_cuda(at::Tensor x) {
   return std::make_tuple(packed, scales);
 }
 
-// One block per query head. Scores are materialized in dynamic shared memory,
-// softmaxed in place, then reused for the PV accumulation. A warp computes a
-// full dot product for one key position (lanes stride over the head dim).
-__global__ void decode_attention_kernel(
+// Vectorized fused decode attention over an FP4 KV cache.
+//
+// A 4-byte word holds 8 FP4 values, which always live inside a single 16-wide
+// scale block, so one uint32 load + one scale byte decode 8 head dims. That
+// cuts the load-instruction count by 8x versus byte-at-a-time decoding, which
+// is what limits this memory/latency-bound path.
+constexpr int kMaxDecodeChunk = 64;  // key-range splits (runtime chosen)
+
+// Stage 1: scores, split over key chunks. grid = (H, nchunks).
+// Each warp scores 2 keys at once: the lanes are split into `ndw`-wide groups
+// (ndw = D/8 dwords), each group handling one key and consuming 8 FP4 values
+// per uint32 load. Q is staged in shared memory.
+__global__ void decode_scores_kernel(
     const __half* __restrict__ q, int H, int KH, int Lk, int D,
     const unsigned char* __restrict__ kp,
-    const unsigned char* __restrict__ ks,
-    const unsigned char* __restrict__ vp,
-    const unsigned char* __restrict__ vs, float scale,
-    __half* __restrict__ out) {
+    const unsigned char* __restrict__ ks, float scale, int nchunks,
+    float* __restrict__ prob) {
   extern __shared__ float shm[];
-  const int DG = (D < 128 ? D : 128);        // threads per reduction group
-  float* s_smem = shm;                        // [Lk] scores
-  float* wacc = shm + Lk;                     // [NG * DG] PV partials
+  __half* qsh = reinterpret_cast<__half*>(shm);   // [D] staged query
   const int h = blockIdx.x;
+  const int chunk = blockIdx.y;
   const int kh = h / (H / KH);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nwarps = blockDim.x >> 5;
+
+  for (int d = threadIdx.x; d < D; d += blockDim.x) qsh[d] = q[(size_t)h * D + d];
+  __syncthreads();
+
+  const size_t kstride = (size_t)KH * (D / 2);
+  const size_t sstride = (size_t)KH * (D / 16);
+  const int ndw = D / 8;
+  const int groups = 32 / ndw;               // keys per warp
+  const int jh = lane / ndw;                 // which key this lane serves
+  const int dw = lane % ndw;                 // which dword
+  const unsigned gmask = (ndw >= 32) ? 0xffffffffu
+                                     : (((1u << ndw) - 1u) << (jh * ndw));
+  float* srow = prob + (size_t)h * Lk;
+
+  const int per = (Lk + nchunks - 1) / nchunks;
+  int j0 = chunk * per;
+  int j1 = min(j0 + per, Lk);
+
+  for (int base = j0 + warp * groups; base < j1; base += nwarps * groups) {
+    int j = base + jh;
+    float acc = 0.0f;
+    if (j < j1) {
+      const unsigned char* kb = kp + (size_t)j * kstride + (size_t)kh * (D / 2);
+      const unsigned char* sb = ks + (size_t)j * sstride + (size_t)kh * (D / 16);
+      unsigned w = reinterpret_cast<const unsigned*>(kb)[dw];
+      float sc = e4m3_decode_fast(sb[dw / 2]);
+      float part = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < 8; k++)
+        part += __half2float(qsh[dw * 8 + k]) * e2m1_decode((w >> (4 * k)) & 0xFu);
+      acc = part * sc;
+    }
+    for (int off = ndw / 2; off > 0; off >>= 1)
+      acc += __shfl_down_sync(gmask, acc, off);
+    if (dw == 0 && j < j1) srow[j] = acc * scale;
+  }
+}
+
+// Stage 1b: masked softmax over the full key range (one block per head).
+__global__ void decode_softmax_kernel(float* __restrict__ prob, int H, int Lk) {
+  extern __shared__ float shm[];
+  float* wred = shm;
+  const int h = blockIdx.x;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
   const int nwarps = blockDim.x >> 5;
-  const __half* qh = q + (size_t)h * D;
+  float* srow = prob + (size_t)h * Lk;
 
-  // ---- S[j] = scale * <q[h], K[j, kh]> ----
-  float local_max = -INFINITY;
-  for (int j = warp; j < Lk; j += nwarps) {
-    const unsigned char* kb = kp + ((size_t)j * KH + kh) * (D / 2);
-    const unsigned char* sb = ks + ((size_t)j * KH + kh) * (D / 16);
-    float acc = 0.0f;
-    for (int d = lane; d < D; d += 32) {
-      acc += __half2float(qh[d]) * deq_fp4(kb, sb, d);
-    }
-    for (int off = 16; off > 0; off >>= 1)
-      acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) {
-      float v = acc * scale;
-      s_smem[j] = v;
-      local_max = fmaxf(local_max, v);
-    }
-  }
+  float m = -INFINITY;
+  for (int j = tid; j < Lk; j += blockDim.x) m = fmaxf(m, srow[j]);
+  for (int off = 16; off > 0; off >>= 1)
+    m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
+  __syncthreads();
+  if (lane == 0) wred[warp] = m;
+  __syncthreads();
   __shared__ float bmax;
   __shared__ float bsum;
-  __shared__ float wred[32];
-  __syncthreads();
-
-  // ---- block-wide max (per-warp partials combined by thread 0) ----
-  if (lane == 0) wred[warp] = local_max;
-  __syncthreads();
   if (tid == 0) {
-    float m = wred[0];
-    for (int w = 1; w < nwarps; w++) m = fmaxf(m, wred[w]);
-    bmax = m;
-    bsum = 0.0f;
+    float r = wred[0];
+    for (int w = 1; w < nwarps; w++) r = fmaxf(r, wred[w]);
+    bmax = r;
   }
   __syncthreads();
 
-  // ---- softmax ----
-  float local_sum = 0.0f;
+  float sum = 0.0f;
   for (int j = tid; j < Lk; j += blockDim.x) {
-    float e = __expf(s_smem[j] - bmax);
-    s_smem[j] = e;
-    local_sum += e;
+    float e = __expf(srow[j] - bmax);
+    srow[j] = e;
+    sum += e;
   }
   for (int off = 16; off > 0; off >>= 1)
-    local_sum += __shfl_down_sync(0xffffffffu, local_sum, off);
+    sum += __shfl_down_sync(0xffffffffu, sum, off);
   __syncthreads();
-  if (lane == 0) wred[warp] = local_sum;
+  if (lane == 0) wred[warp] = sum;
   __syncthreads();
   if (tid == 0) {
-    float sm = 0.0f;
-    for (int w = 0; w < nwarps; w++) sm += wred[w];
-    bsum = sm;
+    float r = 0.f;
+    for (int w = 0; w < nwarps; w++) r += wred[w];
+    bsum = r;
   }
   __syncthreads();
 
-  // ---- O[h, d] = sum_j P[j] * V[j, kh, d] ----
-  // Split the key range across NG groups of threads so the memory-bound PV
-  // accumulation is parallel over j, then combine the partials.
   const float inv = 1.0f / bsum;
-  const int NG = blockDim.x / (D < 128 ? D : 128);
-  const int g = tid / DG;          // group index
-  const int dg = tid % DG;         // lane within group (= head dim)
-  if (dg < D) {
-    const int per = (Lk + NG - 1) / NG;
-    int j0 = g * per;
-    int j1 = j0 + per;
-    if (j1 > Lk) j1 = Lk;
-    const size_t kstride = (size_t)KH * (D / 2);
-    const size_t sstride = (size_t)KH * (D / 16);
-    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-    int j = j0;
-    for (; j + 3 < j1; j += 4) {
-      a0 += s_smem[j + 0] * deq_fp4(vp + (size_t)(j + 0) * kstride + (size_t)kh * (D / 2),
-                                    vs + (size_t)(j + 0) * sstride + (size_t)kh * (D / 16), dg);
-      a1 += s_smem[j + 1] * deq_fp4(vp + (size_t)(j + 1) * kstride + (size_t)kh * (D / 2),
-                                    vs + (size_t)(j + 1) * sstride + (size_t)kh * (D / 16), dg);
-      a2 += s_smem[j + 2] * deq_fp4(vp + (size_t)(j + 2) * kstride + (size_t)kh * (D / 2),
-                                    vs + (size_t)(j + 2) * sstride + (size_t)kh * (D / 16), dg);
-      a3 += s_smem[j + 3] * deq_fp4(vp + (size_t)(j + 3) * kstride + (size_t)kh * (D / 2),
-                                    vs + (size_t)(j + 3) * sstride + (size_t)kh * (D / 16), dg);
-    }
-    for (; j < j1; j++) {
-      const unsigned char* vb = vp + (size_t)j * kstride + (size_t)kh * (D / 2);
-      const unsigned char* sb = vs + (size_t)j * sstride + (size_t)kh * (D / 16);
-      a0 += s_smem[j] * deq_fp4(vb, sb, dg);
-    }
-    wacc[g * DG + dg] = (a0 + a1) + (a2 + a3);
+  for (int j = tid; j < Lk; j += blockDim.x) srow[j] *= inv;
+}
+
+// Stage 2: partial PV over a key chunk. 128 threads = 16 dwords x 8 j-streams.
+__global__ void decode_pv_kernel(
+    const float* __restrict__ prob, int H, int KH, int Lk, int D,
+    const unsigned char* __restrict__ vp,
+    const unsigned char* __restrict__ vs, int nchunks,
+    float* __restrict__ part) {
+  const int h = blockIdx.x;
+  const int chunk = blockIdx.y;
+  const int kh = h / (H / KH);
+  const int tid = threadIdx.x;
+  const int ndw = D / 8;
+  const int dw = tid % ndw;
+  const int js = tid / ndw;
+  const int nstreams = blockDim.x / ndw;
+
+  const int per = (Lk + nchunks - 1) / nchunks;
+  int j0 = chunk * per;
+  int j1 = min(j0 + per, Lk);
+  const float* prow = prob + (size_t)h * Lk;
+  const size_t vstride = (size_t)KH * (D / 2);
+  const size_t sstride = (size_t)KH * (D / 16);
+
+  float acc[8];
+  #pragma unroll
+  for (int k = 0; k < 8; k++) acc[k] = 0.0f;
+
+  for (int j = j0 + js; j < j1; j += nstreams) {
+    const unsigned char* vb = vp + (size_t)j * vstride + (size_t)kh * (D / 2);
+    unsigned w = reinterpret_cast<const unsigned*>(vb)[dw];
+    float sc = e4m3_decode_fast(vs[(size_t)j * sstride + (size_t)kh * (D / 16) + dw / 2]);
+    float p = prow[j] * sc;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) acc[k] += p * e2m1_decode((w >> (4 * k)) & 0xFu);
   }
+
+  // combine the j-streams of this dword through shared memory
+  extern __shared__ float psh[];
+  #pragma unroll
+  for (int k = 0; k < 8; k++) psh[js * D + dw * 8 + k] = acc[k];
   __syncthreads();
-  for (int d = tid; d < D; d += blockDim.x) {
-    float tot = 0.0f;
-    for (int gg = 0; gg < NG; gg++) tot += wacc[gg * DG + d];
-    out[(size_t)h * D + d] = __float2half(tot * inv);
+  if (js == 0) {
+    float* dst = part + ((size_t)h * nchunks + chunk) * D;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+      float t = 0.0f;
+      for (int s2 = 0; s2 < nstreams; s2++) t += psh[s2 * D + dw * 8 + k];
+      dst[dw * 8 + k] = t;
+    }
   }
+}
+
+__global__ void decode_combine_kernel(const float* __restrict__ part, int H,
+                                      int D, int nchunks,
+                                      __half* __restrict__ out) {
+  int h = blockIdx.x;
+  int d = threadIdx.x;
+  if (d >= D) return;
+  float acc = 0.f;
+  for (int c = 0; c < nchunks; c++)
+    acc += part[((size_t)h * nchunks + c) * D + d];
+  out[(size_t)h * D + d] = __float2half(acc);
 }
 
 at::Tensor decode_attention_cuda(at::Tensor q, at::Tensor k_packed,
@@ -799,30 +859,44 @@ at::Tensor decode_attention_cuda(at::Tensor q, at::Tensor k_packed,
   int Lk = k_packed.size(0), KH = k_packed.size(1);
   TORCH_CHECK(k_packed.size(2) * 2 == D, "head_dim mismatch");
   TORCH_CHECK(H % KH == 0, "H must be a multiple of KH");
+  TORCH_CHECK(D % 8 == 0, "head_dim must be a multiple of 8");
   TORCH_CHECK(Lk > 0, "empty KV cache");
 
   c10::cuda::CUDAGuard guard(q.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // Enough blocks to fill the GPU: split the key range adaptively.
+  int nchunks = (Lk + 127) / 128;
+  if (nchunks < 4) nchunks = 4;
+  if (nchunks > kMaxDecodeChunk) nchunks = kMaxDecodeChunk;
+
   at::Tensor out = at::empty({H, D}, q.options());
+  at::Tensor prob = at::empty({H, Lk}, q.options().dtype(at::kFloat));
+  at::Tensor part = at::empty({H, nchunks, D}, q.options().dtype(at::kFloat));
 
-  int threads = 1024;
-  const int DG = (D < 128 ? D : 128);
-  const int NG = threads / DG;
-  size_t smem = ((size_t)Lk + (size_t)NG * DG) * sizeof(float);
-  static int max_smem = -1;
-  if (max_smem < 0) {
-    cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, 0);
-  }
-  if ((int)smem > max_smem) {
-    smem = (size_t)max_smem;  // caller must chunk; guarded by Python fallback
-    TORCH_CHECK(false, "KV cache too long for fused decode attention");
-  }
-
-  decode_attention_kernel<<<H, threads, smem, stream>>>(
+  dim3 score_grid(H, nchunks);
+  decode_scores_kernel<<<score_grid, 128, (size_t)D * sizeof(__half), stream>>>(
       reinterpret_cast<const __half*>(q.data_ptr<at::Half>()), H, KH, Lk, D,
       k_packed.data_ptr<unsigned char>(), k_scales.data_ptr<unsigned char>(),
+      (float)scale, nchunks, prob.data_ptr<float>());
+  CHECK_CUDA(cudaGetLastError());
+
+  decode_softmax_kernel<<<H, 256, 32 * sizeof(float), stream>>>(
+      prob.data_ptr<float>(), H, Lk);
+  CHECK_CUDA(cudaGetLastError());
+
+  int pv_threads = 128;
+  int pv_smem = (pv_threads / (D / 8)) * D * sizeof(float);
+  dim3 pv_grid(H, nchunks);
+  decode_pv_kernel<<<pv_grid, pv_threads, pv_smem, stream>>>(
+      prob.data_ptr<float>(), H, KH, Lk, D,
       v_packed.data_ptr<unsigned char>(), v_scales.data_ptr<unsigned char>(),
-      (float)scale, reinterpret_cast<__half*>(out.data_ptr<at::Half>()));
+      nchunks, part.data_ptr<float>());
+  CHECK_CUDA(cudaGetLastError());
+
+  decode_combine_kernel<<<H, 128, 0, stream>>>(
+      part.data_ptr<float>(), H, D, nchunks,
+      reinterpret_cast<__half*>(out.data_ptr<at::Half>()));
   CHECK_CUDA(cudaGetLastError());
   return out;
 }

@@ -30,9 +30,9 @@ def run_prefill(model, input_ids):
 
 
 @torch.no_grad()
-def run_decode(model, input_ids, steps):
-    cache = None
-    logits, cache = model(input_ids)
+def run_decode(model, prompt_ids, steps):
+    """Prefill `prompt_ids`, then time single-token decode steps."""
+    logits, cache = model(prompt_ids)
     lat = []
     for _ in range(steps):
         tok = logits[-1:].argmax(dim=-1)
@@ -97,15 +97,15 @@ def main():
 
     def bench_decode(model):
         for _ in range(args.warmup):
-            run_decode(model, input_ids[:1], args.decode_steps)
+            run_decode(model, input_ids, args.decode_steps)
         torch.cuda.synchronize()
-        lat = run_decode(model, input_ids[:1], args.decode_steps)
+        lat = run_decode(model, input_ids, args.decode_steps)
         return sum(lat) / len(lat)
 
     fp16_lat = bench_decode(fp16)
     nvfp4_lat = bench_decode(nvfp4)
     nvfp4_attn_lat = bench_decode(nvfp4_attn)
-    print(f"decode:")
+    print(f"decode (KV cache = {args.prefill_len} tokens):")
     print(f"  fp16        {fp16_lat:.2f} ms/tok")
     print(f"  nvfp4       {nvfp4_lat:.2f} ms/tok  ({fp16_lat/nvfp4_lat:.2f}x)")
     print(f"  nvfp4+attn  {nvfp4_attn_lat:.2f} ms/tok  ({fp16_lat/nvfp4_attn_lat:.2f}x)")

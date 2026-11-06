@@ -22,6 +22,22 @@ from omniserve.modeling.layers.layernorm import RMSNorm
 from omniserve.modeling.layers.nvfp4_attention import NVFP4Attention
 
 
+_KV_CAPACITY = 4096
+
+
+def _alloc_kv(cap: int, like: torch.Tensor):
+    """Allocate flat NVFP4 KV buffers with capacity for `cap` tokens."""
+    L, H, D2 = like.shape
+    D = D2 * 2
+    dev, dt = like.device, like.dtype
+    return (
+        torch.zeros(cap, H, D2, dtype=dt, device=dev),
+        torch.zeros(cap, H, D // 16, dtype=dt, device=dev),
+        torch.zeros(cap, H, D2, dtype=dt, device=dev),
+        torch.zeros(cap, H, D // 16, dtype=dt, device=dev),
+    )
+
+
 def _dequant_kv(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """Dequantize an NVFP4 KV cache tile back to fp16 [L, H, D]."""
     import omniserve_backend.qgemm_nvfp4 as B  # noqa: F401  (ensure backend loaded)
@@ -87,42 +103,62 @@ class LlamaAttention(nn.Module):
     def _nvfp4_attn(self, q, k, v, kv_cache):
         """FP4 KV cache + fused FP4 attention.
 
-        The KV cache is stored in NVFP4 (packed E2M1 + per-16 UE4M3 scales),
-        so decode reads 4 bits per element. A single token decode runs one
-        fused kernel (scores + softmax + PV) instead of 2*H GEMM launches.
+        The KV cache is stored in NVFP4 (packed E2M1 + per-16 UE4M3 scales) in
+        a preallocated buffer, so decode reads 4 bits per element and never
+        reallocates/concatenates. A single-token decode runs one fused kernel
+        (scores + softmax + PV) instead of 2*H GEMM launches.
         """
         import omniserve_backend.qgemm_nvfp4 as B
 
         nkp, nks = B.kv_quantize(k)
         nvp, nvs = B.kv_quantize(v)
-        if kv_cache is not None:
-            pkp, pks, pvp, pvs = kv_cache
-            nkp = torch.cat([pkp, nkp], dim=0)
-            nks = torch.cat([pks, nks], dim=0)
-            nvp = torch.cat([pvp, nvp], dim=0)
-            nvs = torch.cat([pvs, nvs], dim=0)
-        new_cache = (nkp, nks, nvp, nvs)
-
-        Lk = nkp.size(0)
         Lq = q.size(0)
+
+        if kv_cache is None:
+            prev = 0
+            cap = max(_KV_CAPACITY, Lq)
+            nkp_buf, nks_buf, nvp_buf, nvs_buf = _alloc_kv(cap, nkp)
+        else:
+            nkp_buf, nks_buf, nvp_buf, nvs_buf, prev = kv_cache
+            cap = nkp_buf.size(0)
+            if prev + Lq > cap:
+                cap = max(cap * 2, prev + Lq)
+                grown = _alloc_kv(cap, nkp)
+                grown[0][:prev].copy_(nkp_buf[:prev])
+                grown[1][:prev].copy_(nks_buf[:prev])
+                grown[2][:prev].copy_(nvp_buf[:prev])
+                grown[3][:prev].copy_(nvs_buf[:prev])
+                nkp_buf, nks_buf, nvp_buf, nvs_buf = grown
+
+        Lk = prev + Lq
+        nkp_buf[prev:Lk].copy_(nkp)
+        nks_buf[prev:Lk].copy_(nks)
+        nvp_buf[prev:Lk].copy_(nvp)
+        nvs_buf[prev:Lk].copy_(nvs)
+        new_cache = (nkp_buf, nks_buf, nvp_buf, nvs_buf, Lk)
+
+        ckp = nkp_buf[:Lk]
+        cks = nks_buf[:Lk]
+        cvp = nvp_buf[:Lk]
+        cvs = nvs_buf[:Lk]
 
         if Lq == 1:
             # ---- fused single-token decode ----
             attn = B.decode_attention(
-                q[0], nkp, nks, nvp, nvs, self.head_dim ** -0.5
+                q[0], ckp, cks, cvp, cvs, self.head_dim ** -0.5
             ).unsqueeze(0)
-        elif kv_cache is None and Lk >= 64:
+        elif prev == 0 and Lk >= 64:
             # ---- prefill: use the exact fp16 K/V, FP4 tensor-core GEMMs ----
             attn = self.nvfp4_attn(q, k, v, causal_start=0)
         elif Lk >= 64:
             # ---- chunked prefill: dequant the FP4 cache, FP4 attention GEMMs ----
             attn = self.nvfp4_attn(
-                q, _dequant_kv(nkp, nks), _dequant_kv(nvp, nvs),
+                q, _dequant_kv(ckp, cks), _dequant_kv(cvp, cvs),
                 causal_start=Lk - Lq,
             )
         else:
-            k_deq = _dequant_kv(nkp, nks)
-            v_deq = _dequant_kv(nvp, nvs)
+            k_deq = _dequant_kv(ckp, cks)
+            v_deq = _dequant_kv(cvp, cvs)
             n_rep = self.num_heads // self.num_kv_heads
             attn = F.scaled_dot_product_attention(
                 q.transpose(0, 1),
