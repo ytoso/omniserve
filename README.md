@@ -11,7 +11,7 @@ points) with a **single-stage W4A4-FP** path (Atom-style):
 
 - **No INT8 intermediate** and **no zero point** — weights *and* activations
   are 4-bit floating point (NVFP4 / E2M1) with per-16 UE4M3 block scales.
-- **Accuracy is intentionally ignored**; the goal is to evaluate efficiency.
+- Efficiency first: accuracy is measured (see below) but not the primary goal.
 
 > Why W4A4 instead of W4A8-FP: cuBLASLt's block-scaled FP4 GEMM requires both
 > operands to be `CUDA_R_4F_E2M1`. A true W4A8-FP (FP8 × FP4) would need a
@@ -111,8 +111,48 @@ load decodes 8 FP4 values.
 
 ## Accuracy
 
-`python3 scripts/nvfp4_accuracy.py` measures each stage against FP16.
-Relative RMSE on Gaussian tensors:
+### Perplexity (the real test)
+
+`scripts/nvfp4_ppl.py` loads a real checkpoint into the NVFP4 model and reports
+WikiText-2 perplexity with the standard sliding window (512 / stride 256).
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com          # CN mirror
+python3 -c "from huggingface_hub import snapshot_download as d; \
+  d('HuggingFaceTB/SmolLM2-135M', local_dir='/tmp/models/SmolLM2-135M')"
+python3 -c "from huggingface_hub import hf_hub_download as d; \
+  d('Salesforce/wikitext','wikitext-2-raw-v1/test-00000-of-00001.parquet', \
+    repo_type='dataset', local_dir='/tmp/data/wikitext2')"
+
+python3 scripts/nvfp4_ppl.py --model /tmp/models/SmolLM2-135M \
+  --parquet /tmp/data/wikitext2/wikitext-2-raw-v1/test-00000-of-00001.parquet
+```
+
+SmolLM2-135M, full WikiText-2 test set (304k tokens):
+
+| Variant | Perplexity | vs FP16 |
+|---|---|---|
+| transformers (fp32) | 20.324 | ref |
+| **ours FP16** | **20.329** | — |
+| W4A16 (4-bit weights only) | 25.065 | +23.3% |
+| W4A4 + FP16 attention | 30.495 | +50.0% |
+| W4A4 + FP4 attention + FP8 KV | 34.935 | +71.9% |
+| W4A4 + FP4 attention + FP4 KV | 34.935 | +71.9% |
+
+Our FP16 path reproduces transformers to 0.02%, so the deltas are purely
+quantization. (KV dtype does not show up here because the sliding window always
+runs as a fresh prefill; it becomes visible when decoding against a cache.)
+
+Reading the table: FP4 weight quantization costs ~23%, FP4 activations add
+another ~22%, FP4 attention another ~19%. W4A4 is a large accuracy hit on a
+135M model — as expected for a format with a single mantissa bit. Use
+`use_nvfp4_attn=False` and/or `quant_acts=False` to trade speed back for
+accuracy.
+
+### Where the error comes from
+
+`scripts/nvfp4_accuracy.py` breaks the error down stage by stage (relative
+RMSE against FP16, Gaussian tensors):
 
 | Stage | before | after |
 |---|---|---|
@@ -135,11 +175,15 @@ Three changes drove this:
    faster* (one row scale instead of per-16 lookups): 14.42 vs 15.78 ms/tok.
 
 FP8 KV is now the default (`kv_dtype="fp8"`); pass `kv_dtype="fp4"` for the
-smallest cache. End-to-end logit cosine vs the FP16 model is 0.9988.
+smallest cache.
 
-> Note: with randomly initialised weights the logits are nearly uniform, so
-> next-token agreement is not a meaningful metric here; only relative error
-> and cosine are reported.
+Also verified: a **Hadamard rotation does not help** here (0.170 -> 0.163).
+QuaRot's win comes from per-channel quantization; per-16 block scales already
+absorb outliers.
+
+Next accuracy step would be **GPTQ** (Hessian-aware weight rounding with the
+WikiText calibration set we now have) — that targets the +23% weight term,
+which is the largest single contributor and cannot be fixed by better scaling.
 
 ### cuBLASLt FP4 (W4A4) vs FP16 GEMM on Jetson AGX Thor (sm_110, 20 SMs)
 

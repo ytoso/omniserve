@@ -25,8 +25,10 @@ class NVFP4Linear(torch.nn.Module):
         out_features: int,
         bias: bool = True,
         block_size: int = 16,
+        quant_acts: bool = True,
     ):
         super().__init__()
+        self.quant_acts = quant_acts
         self.in_features = in_features
         self.out_features = out_features
         self.block_size = block_size
@@ -54,6 +56,12 @@ class NVFP4Linear(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.quant_acts:
+            # W4A16: exact activations, dequantized 4-bit weights.
+            w = dequantize_nvfp4_abs(self.qweight, self.w_scale)
+            bias = None if self.bias is None else self.bias.float()
+            out = torch.nn.functional.linear(x.float(), w, bias)
+            return out.to(x.dtype)
         try:
             import omniserve_backend.qgemm_nvfp4 as qgemm_nvfp4
 
@@ -79,12 +87,14 @@ class NVFP4Linear(torch.nn.Module):
         return out.to(x.dtype)
 
     @classmethod
-    def from_linear(cls, linear: torch.nn.Linear, block_size: int = 16) -> "NVFP4Linear":
+    def from_linear(cls, linear: torch.nn.Linear, block_size: int = 16,
+                    quant_acts: bool = True) -> "NVFP4Linear":
         q_linear = cls(
             linear.in_features,
             linear.out_features,
             linear.bias is not None,
             block_size,
+            quant_acts=quant_acts,
         )
         qweight, w_scale = quantize_nvfp4_abs(linear.weight.data, block_size)
         q_linear.qweight.copy_(qweight)

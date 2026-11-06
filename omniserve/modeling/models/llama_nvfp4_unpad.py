@@ -62,6 +62,19 @@ def _dequant_kv(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return dequantize_nvfp4_abs(q, s).reshape(L, H, D).half()
 
 
+def rope_theta(config) -> float:
+    """RoPE base, supporting both the legacy and the transformers>=5 layout."""
+    rp = getattr(config, "rope_parameters", None)
+    if isinstance(rp, dict) and "rope_theta" in rp:
+        return float(rp["rope_theta"])
+    return float(getattr(config, "rope_theta", 10000.0))
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
 class LlamaAttention(nn.Module):
     def __init__(self, config: LlamaConfig, use_nvfp4_attn: bool = False,
                  kv_dtype: str = "fp8"):
@@ -82,6 +95,25 @@ class LlamaAttention(nn.Module):
         if use_nvfp4_attn:
             self.nvfp4_attn = NVFP4Attention(self.head_dim, causal=True)
 
+        # Rotary position embeddings (HF Llama convention).
+        inv_freq = 1.0 / (
+            rope_theta(config)
+            ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _apply_rope(self, q, k, start: int):
+        Lq = q.size(0)
+        pos = torch.arange(start, start + Lq, device=q.device,
+                           dtype=self.inv_freq.dtype)
+        freqs = torch.outer(pos, self.inv_freq.to(q.device))       # [Lq, D/2]
+        emb = torch.cat([freqs, freqs], dim=-1)                     # [Lq, D]
+        cos = emb.cos().to(q.dtype).unsqueeze(1)                    # [Lq,1,D]
+        sin = emb.sin().to(q.dtype).unsqueeze(1)
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+        return q, k
+
     def _reshape(self, x: torch.Tensor, heads: int) -> torch.Tensor:
         return x.view(-1, heads, self.head_dim)
 
@@ -93,6 +125,14 @@ class LlamaAttention(nn.Module):
         q = self._reshape(self.q_proj(hidden_states), self.num_heads)
         k = self._reshape(self.k_proj(hidden_states), self.num_kv_heads)
         v = self._reshape(self.v_proj(hidden_states), self.num_kv_heads)
+
+        if kv_cache is None:
+            start = 0
+        elif self.use_nvfp4_attn:
+            start = kv_cache[4]
+        else:
+            start = kv_cache[0].size(0)
+        q, k = self._apply_rope(q, k, start)
 
         if self.use_nvfp4_attn:
             return self._nvfp4_attn(q, k, v, kv_cache)
@@ -106,10 +146,20 @@ class LlamaAttention(nn.Module):
         n_rep = self.num_heads // self.num_kv_heads
         k_rep = k.repeat_interleave(n_rep, dim=1)
         v_rep = v.repeat_interleave(n_rep, dim=1)
-        attn = F.scaled_dot_product_attention(
-            q.transpose(0, 1), k_rep.transpose(0, 1), v_rep.transpose(0, 1),
-            is_causal=True,
-        ).transpose(0, 1)
+        if kv_cache is None:
+            attn = F.scaled_dot_product_attention(
+                q.transpose(0, 1), k_rep.transpose(0, 1), v_rep.transpose(0, 1),
+                is_causal=True,
+            ).transpose(0, 1)
+        else:
+            Lq_, Lk_ = q.size(0), k.size(0)
+            i = torch.arange(Lq_, device=q.device).unsqueeze(1)
+            j = torch.arange(Lk_, device=q.device).unsqueeze(0)
+            mask = j > (Lk_ - Lq_ + i)
+            attn = F.scaled_dot_product_attention(
+                q.transpose(0, 1), k_rep.transpose(0, 1), v_rep.transpose(0, 1),
+                attn_mask=mask,
+            ).transpose(0, 1)
 
         out = self.o_proj(attn.reshape(-1, self.q_size))
         return out, new_cache
@@ -259,7 +309,7 @@ class LlamaForCausalLM(nn.Module):
         return logits, new_caches
 
     @torch.no_grad()
-    def replace_linears_with_nvfp4(self):
+    def replace_linears_with_nvfp4(self, quant_acts: bool = True):
         """Replace every projection nn.Linear with NVFP4Linear (W4A4)."""
         for name, module in list(self.named_modules()):
             if isinstance(module, nn.Linear) and (
@@ -272,7 +322,8 @@ class LlamaForCausalLM(nn.Module):
                 parts = name.split(".")[:-1]
                 for p in parts:
                     parent = getattr(parent, p)
-                q = NVFP4Linear.from_linear(module, block_size=16)
+                q = NVFP4Linear.from_linear(module, block_size=16,
+                                            quant_acts=quant_acts)
                 q = q.to(device=module.weight.device, dtype=module.weight.dtype)
                 setattr(parent, name.split(".")[-1], q)
         return self
