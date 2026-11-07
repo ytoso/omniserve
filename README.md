@@ -124,47 +124,52 @@ python3 -c "from huggingface_hub import hf_hub_download as d; \
   d('Salesforce/wikitext','wikitext-2-raw-v1/test-00000-of-00001.parquet', \
     repo_type='dataset', local_dir='/tmp/data/wikitext2')"
 
+python3 -c "from huggingface_hub import hf_hub_download as d; \
+  d('Salesforce/wikitext','wikitext-2-raw-v1/train-00000-of-00001.parquet', \
+    repo_type='dataset', local_dir='/tmp/data/wikitext2')"
+
 python3 scripts/nvfp4_ppl.py --model /tmp/models/SmolLM2-135M \
-  --parquet /tmp/data/wikitext2/wikitext-2-raw-v1/test-00000-of-00001.parquet
+  --parquet      /tmp/data/wikitext2/wikitext-2-raw-v1/test-00000-of-00001.parquet \
+  --calib-parquet /tmp/data/wikitext2/wikitext-2-raw-v1/train-00000-of-00001.parquet \
+  --gptq --calib-batches 16
 ```
 
-WikiText-2 test set, sliding window 512 / stride 256. Two model sizes show how
-sensitivity scales:
+WikiText-2 test set, sliding window 512 / stride 256, GPTQ calibrated on the
+WikiText-2 **train** split (no test-set leakage):
 
-| Variant | SmolLM2-135M (304k tok) | SmolLM2-360M (32k tok) |
+| Variant | SmolLM2-135M (8k tok) | SmolLM2-360M (32k tok) |
 |---|---|---|
-| transformers (fp32) | 20.324 | 15.032 |
-| **ours FP16** | **20.329** (+0.02%) | **15.034** (+0.01%) |
-| W4A16 (4-bit weights only) | 25.065 (+23.3%) | 17.006 (+13.1%) |
-| W4A4 + FP16 attention | 30.495 (+50.0%) | 18.837 (+25.3%) |
-| W4A4 + FP4 attention + FP8 KV | 34.935 (+71.9%) | 21.090 (+40.3%) |
-| W4A4 + FP4 attention + FP4 KV | 34.935 (+71.9%) | 21.090 (+40.3%) |
+| transformers (fp32) | 23.620 | 15.032 |
+| **ours FP16** | **23.627** | **15.034** |
+| W4A16 (4-bit weights only) | 29.486 (+24.8%) | 17.006 (+13.1%) |
+| W4A4 + FP16 attention | 35.691 (+51.1%) | 18.837 (+25.3%) |
+| **W4A4 + GPTQ + FP16 attention** | **35.550 (+50.5%)** | **18.164 (+20.8%)** |
+| W4A4 + FP4 attention + FP8 KV | 41.073 (+73.8%) | 21.090 (+40.3%) |
+| **W4A4 + GPTQ + FP4 attention** | **39.940 (+69.0%)** | **20.392 (+35.6%)** |
+
+(On the full 304k-token test set the 135M figures are FP16 20.329, W4A16 +23.3%,
+W4A4 +50.0%, FP4 attn +71.9% — same picture.)
 
 Our FP16 path reproduces transformers to 0.02%, so the deltas are purely
-quantization. (KV dtype does not show up here because each window is a fresh
-prefill; it only matters when decoding against a cache.)
+quantization. KV dtype does not show here because each window is a fresh
+prefill; it only matters when decoding against a cache.
 
-**Is this acceptable?** Not as a deployable quantized model — but it is the
-expected result for a *naive* RTN W4A4 recipe, and the gap shrinks quickly with
-model size (135M +50% -> 360M +25%, roughly halving per 2.7x parameters).
-Published NVFP4 W4A4 numbers (a few percent on 7-8B) rely on GPTQ/AWQ-style
-calibration, which we do not do yet.
+**Is this acceptable?** Not for deployment, but the recipe is now measured
+honestly rather than guessed:
 
-Layer-level checks on real weights/activations (SmolLM2, captured inputs):
+* The hit roughly **halves for 2.7x more parameters** (135M +51% -> 360M +25%),
+  so most of it is small-model sensitivity.
+* **GPTQ helps far less than it does for INT4.** It buys ~1-5 points here
+  (W4A4 135M +51.1% -> +50.5%; 360M +25.3% -> +20.8%; W4A16 135M +24.8% ->
+  +22.7%). Published GPTQ gains on INT4-g128 are 2-3x the error reduction.
+  The likely reason: per-16 block scales already absorb the structure GPTQ
+  exploits, and E2M1's *relative* grid makes error redirection much weaker
+  than on a uniform INT4 grid.
+* Calibrating on the test split appeared to give a much better GPTQ number
+  (+41.6%); that was leakage, and the harness now takes a separate
+  `--calib-parquet`.
 
-| quantizer | down_proj rel err | o_proj rel err |
-|---|---|---|
-| NVFP4 per-16 (ours) | 0.088 | 0.076-0.092 |
-| INT4 g16 RTN | 0.084 | 0.077-0.087 |
-| NVFP4 + Hadamard-128 | 0.089-0.093 | n/a (dim not divisible) |
-
-So per-16 NVFP4 is on par with INT4-g16, and a Hadamard rotation does **not**
-help — QuaRot's win comes from per-channel quantization, while per-16 block
-scales already absorb outliers. This was re-verified on real weights after an
-initial test on synthetic Gaussians gave a misleadingly small gain.
-
-Use `quant_acts=False` (W4A16) and/or `use_nvfp4_attn=False` to trade speed
-back for accuracy.
+### Where the error comes from
 
 ### Where the error comes from
 
