@@ -128,26 +128,43 @@ python3 scripts/nvfp4_ppl.py --model /tmp/models/SmolLM2-135M \
   --parquet /tmp/data/wikitext2/wikitext-2-raw-v1/test-00000-of-00001.parquet
 ```
 
-SmolLM2-135M, full WikiText-2 test set (304k tokens):
+WikiText-2 test set, sliding window 512 / stride 256. Two model sizes show how
+sensitivity scales:
 
-| Variant | Perplexity | vs FP16 |
+| Variant | SmolLM2-135M (304k tok) | SmolLM2-360M (32k tok) |
 |---|---|---|
-| transformers (fp32) | 20.324 | ref |
-| **ours FP16** | **20.329** | — |
-| W4A16 (4-bit weights only) | 25.065 | +23.3% |
-| W4A4 + FP16 attention | 30.495 | +50.0% |
-| W4A4 + FP4 attention + FP8 KV | 34.935 | +71.9% |
-| W4A4 + FP4 attention + FP4 KV | 34.935 | +71.9% |
+| transformers (fp32) | 20.324 | 15.032 |
+| **ours FP16** | **20.329** (+0.02%) | **15.034** (+0.01%) |
+| W4A16 (4-bit weights only) | 25.065 (+23.3%) | 17.006 (+13.1%) |
+| W4A4 + FP16 attention | 30.495 (+50.0%) | 18.837 (+25.3%) |
+| W4A4 + FP4 attention + FP8 KV | 34.935 (+71.9%) | 21.090 (+40.3%) |
+| W4A4 + FP4 attention + FP4 KV | 34.935 (+71.9%) | 21.090 (+40.3%) |
 
 Our FP16 path reproduces transformers to 0.02%, so the deltas are purely
-quantization. (KV dtype does not show up here because the sliding window always
-runs as a fresh prefill; it becomes visible when decoding against a cache.)
+quantization. (KV dtype does not show up here because each window is a fresh
+prefill; it only matters when decoding against a cache.)
 
-Reading the table: FP4 weight quantization costs ~23%, FP4 activations add
-another ~22%, FP4 attention another ~19%. W4A4 is a large accuracy hit on a
-135M model — as expected for a format with a single mantissa bit. Use
-`use_nvfp4_attn=False` and/or `quant_acts=False` to trade speed back for
-accuracy.
+**Is this acceptable?** Not as a deployable quantized model — but it is the
+expected result for a *naive* RTN W4A4 recipe, and the gap shrinks quickly with
+model size (135M +50% -> 360M +25%, roughly halving per 2.7x parameters).
+Published NVFP4 W4A4 numbers (a few percent on 7-8B) rely on GPTQ/AWQ-style
+calibration, which we do not do yet.
+
+Layer-level checks on real weights/activations (SmolLM2, captured inputs):
+
+| quantizer | down_proj rel err | o_proj rel err |
+|---|---|---|
+| NVFP4 per-16 (ours) | 0.088 | 0.076-0.092 |
+| INT4 g16 RTN | 0.084 | 0.077-0.087 |
+| NVFP4 + Hadamard-128 | 0.089-0.093 | n/a (dim not divisible) |
+
+So per-16 NVFP4 is on par with INT4-g16, and a Hadamard rotation does **not**
+help — QuaRot's win comes from per-channel quantization, while per-16 block
+scales already absorb outliers. This was re-verified on real weights after an
+initial test on synthetic Gaussians gave a misleadingly small gain.
+
+Use `quant_acts=False` (W4A16) and/or `use_nvfp4_attn=False` to trade speed
+back for accuracy.
 
 ### Where the error comes from
 
