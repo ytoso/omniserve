@@ -80,7 +80,8 @@ def ppl_hf(model, ids, window, stride, device="cuda"):
 
 
 def build_local(cfg, state, device, use_nvfp4_attn=False, kv_dtype="fp8",
-                quantize=True, quant_acts=True):
+                quantize=True, quant_acts=True, gptq=False, calib_ids=None,
+                calib_batches=8, calib_len=512):
     m = LlamaForCausalLM(cfg, use_nvfp4_attn=use_nvfp4_attn,
                          kv_dtype=kv_dtype)
     missing, unexpected = m.load_state_dict(state, strict=False)
@@ -92,7 +93,12 @@ def build_local(cfg, state, device, use_nvfp4_attn=False, kv_dtype="fp8",
         m.lm_head.weight = m.model.embed_tokens.weight
     m = m.to(device).half().eval()
     if quantize:
-        m.replace_linears_with_nvfp4(quant_acts=quant_acts)
+        if gptq:
+            from omniserve.utils.gptq import gptq_quantize_model
+            gptq_quantize_model(m, calib_ids, seq_len=calib_len,
+                                n_batches=calib_batches, device=device)
+        else:
+            m.replace_linears_with_nvfp4(quant_acts=quant_acts)
     return m
 
 
@@ -105,6 +111,12 @@ def main():
     ap.add_argument("--stride", type=int, default=256)
     ap.add_argument("--max-tokens", type=int, default=0,
                     help="truncate the corpus (0 = all)")
+    ap.add_argument("--gptq", action="store_true",
+                    help="use GPTQ weight rounding (calibrated on the corpus)")
+    ap.add_argument("--calib-parquet", default=None,
+                    help="separate calibration corpus (defaults to --parquet)")
+    ap.add_argument("--calib-batches", type=int, default=8)
+    ap.add_argument("--calib-len", type=int, default=512)
     ap.add_argument("--dtype", default="float32",
                     help="dtype for the transformers reference model")
     args = ap.parse_args()
@@ -117,6 +129,13 @@ def main():
         ids = ids[: args.max_tokens]
     print(f"corpus: {ids.numel()} tokens, window {args.window}, "
           f"stride {args.stride}\n")
+
+    calib_ids = ids
+    if args.calib_parquet:
+        calib_text = load_corpus(argparse.Namespace(parquet=args.calib_parquet,
+                                                    text_dir=None))
+        calib_ids = to_ids(tokenizer, calib_text)
+        print(f"calibration corpus: {calib_ids.numel()} tokens\n")
 
     cfg = AutoConfig.from_pretrained(args.model)
     from safetensors.torch import load_file
@@ -139,6 +158,24 @@ def main():
     results.append(("ours FP16", ppl_local(m, ids, args.window, args.stride)))
     del m
     torch.cuda.empty_cache()
+
+    if args.gptq:
+        m = build_local(cfg, state, device, quantize=True, gptq=True,
+                        calib_ids=calib_ids, calib_batches=args.calib_batches,
+                        calib_len=args.calib_len)
+        results.append(("W4A4 + GPTQ + FP16 attn",
+                        ppl_local(m, ids, args.window, args.stride)))
+        del m
+        torch.cuda.empty_cache()
+
+        m = build_local(cfg, state, device, use_nvfp4_attn=True, kv_dtype="fp8",
+                        quantize=True, gptq=True, calib_ids=calib_ids,
+                        calib_batches=args.calib_batches,
+                        calib_len=args.calib_len)
+        results.append(("W4A4 + GPTQ + FP4 attn",
+                        ppl_local(m, ids, args.window, args.stride)))
+        del m
+        torch.cuda.empty_cache()
 
     # 3a) W4A16: 4-bit weights, exact activations
     m = build_local(cfg, state, device, quantize=True, quant_acts=False)
